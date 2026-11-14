@@ -14,6 +14,13 @@ import {
 
 import { buttonVariants } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
+import {
+  FacebookLogoIcon,
+  InstagramLogoIcon,
+  LinkedinLogoIcon,
+  XLogoIcon,
+  YoutubeLogoIcon,
+} from "@phosphor-icons/react/dist/ssr";
 
 const QUICK_LINKS = [
   { title: "Home", href: "/" },
@@ -40,6 +47,29 @@ const LEGAL_LINKS = [
   { title: "Privacy Policy", href: "/privacy" },
   { title: "Terms of Service", href: "/terms" },
   { title: "Safety Policy", href: "/safety" },
+];
+
+const SOCIAL_LINKS = [
+  {
+    name: "Facebook",
+    href: "https://facebook.com",
+    icon: FacebookLogoIcon,
+  },
+  {
+    name: "Instagram",
+    href: "https://instagram.com",
+    icon: InstagramLogoIcon,
+  },
+  {
+    name: "X (Twitter)",
+    href: "https://x.com",
+    icon: XLogoIcon,
+  },
+  {
+    name: "LinkedIn",
+    href: "https://linkedin.com",
+    icon: LinkedinLogoIcon,
+  },
 ];
 
 function FooterLink({
@@ -90,7 +120,7 @@ export default function Footer() {
 
             <p className="max-w-xl text-sm leading-7 text-white/85 sm:text-base">
               Explore childcare options, compare services, and
-              find care that fits your family's schedule.
+              find care that fits your family&apos;s schedule.
             </p>
           </div>
 
@@ -160,6 +190,30 @@ export default function Footer() {
                 <Clock3 size={14} />
                 Flexible Care
               </span>
+            </div>
+
+            {/* Social Media Links */}
+            <div className="pt-1">
+              <p className="mb-3 text-xs font-semibold tracking-wider text-[#075E58] uppercase dark:text-teal-300">
+                Follow Us
+              </p>
+              <div className="flex flex-wrap items-center gap-2.5">
+                {SOCIAL_LINKS.map((social) => {
+                  const Icon = social.icon;
+                  return (
+                    <Link
+                      key={social.name}
+                      href={social.href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      aria-label={`Follow Little Steps on ${social.name}`}
+                      className="flex size-9 items-center justify-center rounded-full border border-[#087F78]/20 bg-white text-slate-600 shadow-2xs transition-all duration-200 hover:-translate-y-0.5 hover:border-[#087F78] hover:bg-[#087F78] hover:text-white dark:border-white/15 dark:bg-white/5 dark:text-slate-300 dark:hover:border-teal-400 dark:hover:bg-teal-500 dark:hover:text-slate-950"
+                    >
+                      <Icon size={18} weight="regular" />
+                    </Link>
+                  );
+                })}
+              </div>
             </div>
           </div>
 
