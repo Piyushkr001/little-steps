@@ -22,7 +22,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       className={`${exo2.className} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
-        <ThemeProvider>
+        <ThemeProvider
+          attribute="class"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
+        >
           <Navbar />
           {children}
           <Footer />
