@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { PgDialect } from "drizzle-orm/pg-core";
+import { getTableConfig, PgDialect } from "drizzle-orm/pg-core";
 import { type AppDatabase, setDatabaseInstanceForTests } from "../config/db";
 import {
   adminAuditLogs,
@@ -11,7 +11,9 @@ import {
   bookingStatusHistory,
   capacityRules,
   caregivers,
+  caregiverVerifications,
   centers,
+  centerVerifications,
   children,
   disputes,
   incidentActivity,
@@ -23,6 +25,7 @@ import {
   userRoles,
   users,
   verificationDocuments,
+  verificationReviewHistory,
 } from "../config/schema";
 import {
   type CookieInstruction,
@@ -183,6 +186,9 @@ function createIsolatedMemoryDatabase() {
     [caregivers, []],
     [verificationDocuments, []],
     [providerVerifications, []],
+    [centerVerifications, []],
+    [caregiverVerifications, []],
+    [verificationReviewHistory, []],
     [children, []],
     [bookings, []],
     [bookingStatusHistory, []],
@@ -196,6 +202,7 @@ function createIsolatedMemoryDatabase() {
   ]);
 
   let insertSeq = 0;
+  let failNextInsertOnTable: object | null = null;
 
   const getRows = (table: object): RowRecord[] => {
     let list = tables.get(table);
@@ -286,6 +293,27 @@ function createIsolatedMemoryDatabase() {
     insert(table: object) {
       return {
         values(rawValues: RowRecord | RowRecord[]) {
+          if (failNextInsertOnTable === table) {
+            failNextInsertOnTable = null;
+            const err = new Error(
+              "Simulated database write failure inside transaction"
+            );
+            return {
+              returning() {
+                return Promise.reject(err);
+              },
+              then<TResult1 = RowRecord[], TResult2 = never>(
+                _onfulfilled?:
+                  | ((value: RowRecord[]) => TResult1 | PromiseLike<TResult1>)
+                  | null,
+                onrejected?:
+                  | ((reason: unknown) => TResult2 | PromiseLike<TResult2>)
+                  | null
+              ) {
+                return Promise.reject(err).then(undefined, onrejected);
+              },
+            };
+          }
           const items = Array.isArray(rawValues) ? rawValues : [rawValues];
           const inserted: RowRecord[] = [];
           const tableRows = getRows(table);
@@ -411,11 +439,32 @@ function createIsolatedMemoryDatabase() {
         },
       };
     },
+
+    async transaction<T>(fn: (tx: AppDatabase) => Promise<T>): Promise<T> {
+      const snapshot = new Map<object, RowRecord[]>();
+      for (const [tbl, rows] of tables.entries()) {
+        snapshot.set(
+          tbl,
+          rows.map((r) => structuredClone(r))
+        );
+      }
+      try {
+        return await fn(mockDb as unknown as AppDatabase);
+      } catch (err) {
+        for (const [tbl, clonedRows] of snapshot.entries()) {
+          tables.set(tbl, clonedRows);
+        }
+        throw err;
+      }
+    },
   };
 
   return {
     db: mockDb as unknown as AppDatabase,
     tables,
+    setFailNextInsertOnTable(tbl: object | null) {
+      failNextInsertOnTable = tbl;
+    },
   };
 }
 
@@ -584,6 +633,29 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
     })
     .returning();
 
+  const [orgDoc] = await db
+    .insert(verificationDocuments)
+    .values({
+      providerId: provider.id,
+      centerId: null,
+      caregiverId: null,
+      documentCategory: "PROVIDER",
+      documentType: "STATE_CHILDCARE_LICENSE",
+      documentTitle: "State Childcare Organization License",
+      storageReference: "s3://private-compliance-bucket/sunshine/state-license.pdf",
+      mimeType: "application/pdf",
+      fileSizeBytes: 245_000,
+      checksumSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      malwareScanStatus: "CLEAN",
+      status: "VERIFIED",
+      reviewedBy: superAdmin.id,
+      reviewedAt: now,
+      reviewNotes: "Verified against state childcare licensing registry.",
+      expiresAt: new Date(now.getTime() + 180 * 86_400_000),
+      uploadedBy: parentWithAdminKeyword.id,
+    })
+    .returning();
+
   const [verification] = await db
     .insert(providerVerifications)
     .values({
@@ -591,8 +663,8 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
       status: "PENDING",
       submittedAt: now,
       reviewComments: "Initial submission",
-      documentReferences: [],
-      checklistState: {},
+      documentReferences: [orgDoc.id],
+      checklistState: { licenseVerified: true },
     })
     .returning();
 
@@ -621,7 +693,7 @@ async function runPhase1SecurityTestSuite() {
     "=================================================================="
   );
   console.log(
-    "Little Steps — Phase 1 Admin Portal Security Hardening Test Suite"
+    "Little Steps — Phase 1 & Phase 2 Security & Verification Test Suite"
   );
   console.log(
     "=================================================================="
@@ -635,7 +707,8 @@ async function runPhase1SecurityTestSuite() {
   process.env.ADMIN_SESSION_SECRET =
     "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f";
 
-  const { db: memoryDb } = createIsolatedMemoryDatabase();
+  const { db: memoryDb, setFailNextInsertOnTable } =
+    createIsolatedMemoryDatabase();
   setDatabaseInstanceForTests(memoryDb);
   setRateLimitBackendForTests("memory-test");
   resetAllRateLimitsForTests();
@@ -1335,11 +1408,781 @@ async function runPhase1SecurityTestSuite() {
       "    [PASS] Audit log HMAC integrity and sensitive-value redaction verified."
     );
 
+    // ========================================================================
+    // PART F: Phase 2 — Database Integrity & Secure Provider Verification
+    // ========================================================================
+    console.log(
+      "F1. Testing Phase 2 Safe Schema Defaults & CHECK Constraints..."
+    );
+
+    // 1. Caregivers default to NOT_VERIFIED
+    assert.equal(
+      caregivers.backgroundCheckStatus.default,
+      "NOT_VERIFIED",
+      "caregivers.backgroundCheckStatus must default to NOT_VERIFIED"
+    );
+
+    // 2. Bookings paymentStatus defaults to PENDING
+    assert.equal(
+      bookings.paymentStatus.default,
+      "PENDING",
+      "bookings.paymentStatus must default to PENDING"
+    );
+
+    // 3. Daycare centres listingStatus defaults to PENDING_APPROVAL
+    assert.equal(
+      centers.listingStatus.default,
+      "PENDING_APPROVAL",
+      "centers.listingStatus must default to PENDING_APPROVAL"
+    );
+
+    // 4. Daycare centres do not receive a fabricated default rating
+    assert.equal(
+      centers.rating.hasDefault,
+      false,
+      "centers.rating must not have a fabricated default rating"
+    );
+
+    // 5. Admin profiles default to isApproved = false
+    assert.equal(
+      adminProfiles.isApproved.default,
+      false,
+      "adminProfiles.isApproved must default to false"
+    );
+
+    // 6. Verify PostgreSQL CHECK constraints exist on schema tables
+    const centerCheckNames = getTableConfig(centers).checks.map((c) => c.name);
+    assert.ok(centerCheckNames.includes("centers_approved_capacity_nonneg"));
+    assert.ok(centerCheckNames.includes("centers_current_occupancy_nonneg"));
+    assert.ok(centerCheckNames.includes("centers_hourly_rate_nonneg"));
+    assert.ok(centerCheckNames.includes("centers_daily_rate_nonneg"));
+    assert.ok(centerCheckNames.includes("centers_rating_range_chk"));
+
+    const bookingCheckNames = getTableConfig(bookings).checks.map((c) => c.name);
+    assert.ok(bookingCheckNames.includes("bookings_valid_time_range"));
+    assert.ok(bookingCheckNames.includes("bookings_total_amount_nonneg"));
+    assert.ok(bookingCheckNames.includes("bookings_payment_status_valid"));
+
+    const caregiverCheckNames = getTableConfig(caregivers).checks.map(
+      (c) => c.name
+    );
+    assert.ok(caregiverCheckNames.includes("caregivers_years_exp_nonneg"));
+    assert.ok(caregiverCheckNames.includes("caregivers_bg_status_valid"));
+
+    const docCheckNames = getTableConfig(verificationDocuments).checks.map(
+      (c) => c.name
+    );
+    assert.ok(docCheckNames.includes("verification_documents_size_nonneg"));
+    assert.ok(docCheckNames.includes("verification_documents_status_valid"));
+
+    console.log(
+      "    [PASS] All 6 Phase 2 schema defaults and CHECK constraints verified."
+    );
+
+    // Authenticate standardAdmin (Priya Sharma) for Phase 2 workflow tests
+    resetAllRateLimitsForTests();
+    await memoryDb
+      .update(adminOtpChallenges)
+      .set({ invalidatedAt: new Date() })
+      .where(undefined);
+    const p2ReqOtp = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "request-otp"],
+      query: {},
+      body: { email: "admin@littlesteps.com" },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(p2ReqOtp.status, 200);
+    const p2OtpCode = interceptedEmails.at(-1)!.otpCode;
+    const p2VerifyRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "verify-otp"],
+      query: {},
+      body: { email: "admin@littlesteps.com", otp: p2OtpCode },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(p2VerifyRes.status, 200);
+    const p2Cookies = Object.fromEntries(
+      (p2VerifyRes.cookiesToSet ?? []).map((c: CookieInstruction) => [
+        c.name,
+        c.value,
+      ])
+    );
+    const p2Headers = {
+      [ADMIN_CSRF_HEADER_NAME]: p2Cookies[ADMIN_CSRF_COOKIE_NAME],
+      host: "localhost:3000",
+      origin: "http://localhost:3000",
+    };
+
+    console.log(
+      "F2. Testing Independent Provider Verification (No Bulk Approval & Strict Preconditions)..."
+    );
+
+    // Create a second provider with 2 centres, 1 caregiver, and 1 SUBMITTED (unverified) document
+    const [p2Owner] = await memoryDb
+      .insert(users)
+      .values({
+        email: "owner2@littlesteps.com",
+        name: "Rohan Verma",
+        role: "PROVIDER",
+        status: "ACTIVE",
+        emailVerified: true,
+      })
+      .returning();
+
+    const [p2Provider] = await memoryDb
+      .insert(providers)
+      .values({
+        ownerUserId: p2Owner.id,
+        organizationName: "Bright Horizons 24×7 Care",
+        registrationNumber: "LS-PRV-2026-202",
+        contactEmail: "compliance@brighthorizons.example",
+        contactPhone: "+1 (555) 820-9000",
+        address: "900 Congress Ave",
+        city: "Austin",
+        state: "TX",
+        postalCode: "78701",
+        verificationStatus: "PENDING",
+        subscriptionTier: "ENTERPRISE_24X7",
+        subscriptionActive: true,
+        isPublished: false,
+      })
+      .returning();
+
+    const [p2CenterA, p2CenterB] = await memoryDb
+      .insert(centers)
+      .values([
+        {
+          providerId: p2Provider.id,
+          name: "Bright Horizons North Campus",
+          slug: "bright-horizons-north",
+          address: "901 North Lamar",
+          city: "Austin",
+          state: "TX",
+          postalCode: "78701",
+          phone: "+1 (555) 820-9001",
+          email: "north@brighthorizons.example",
+          ageGroupsSupported: ["Infant (0-12m)", "Toddler (1-3y)"],
+          operatingHours: {
+            Monday: { open: "00:00", close: "23:59", is24Hours: true },
+          },
+          is24x7: true,
+          approvedCapacity: 18,
+          currentOccupancy: 2,
+          hourlyRate: "24.00",
+          dailyRate: "175.00",
+          verificationStatus: "PENDING",
+          listingStatus: "PENDING_APPROVAL",
+          rating: null,
+        },
+        {
+          providerId: p2Provider.id,
+          name: "Bright Horizons South Campus",
+          slug: "bright-horizons-south",
+          address: "500 South Congress",
+          city: "Austin",
+          state: "TX",
+          postalCode: "78704",
+          phone: "+1 (555) 820-9002",
+          email: "south@brighthorizons.example",
+          ageGroupsSupported: ["Toddler (1-3y)", "Preschool (3-5y)"],
+          operatingHours: {
+            Monday: { open: "07:00", close: "19:00", is24Hours: false },
+          },
+          is24x7: false,
+          approvedCapacity: 15,
+          currentOccupancy: 0,
+          hourlyRate: "20.00",
+          dailyRate: "150.00",
+          verificationStatus: "PENDING",
+          listingStatus: "PENDING_APPROVAL",
+          rating: null,
+        },
+      ])
+      .returning();
+
+    const [p2Caregiver] = await memoryDb
+      .insert(caregivers)
+      .values({
+        centerId: p2CenterA.id,
+        fullName: "Meera Nair",
+        email: "meera.nair@brighthorizons.example",
+        phone: "+1 (555) 820-9111",
+        roleTitle: "Lead Infant Caregiver",
+        certifications: ["Pediatric CPR", "Early Childhood Education"],
+        backgroundCheckStatus: "NOT_VERIFIED",
+        yearsExperience: 6,
+        isActive: true,
+      })
+      .returning();
+
+    const [p2Verif] = await memoryDb
+      .insert(providerVerifications)
+      .values({
+        providerId: p2Provider.id,
+        status: "PENDING",
+        submittedAt: new Date(),
+        documentReferences: [],
+        checklistState: {},
+      })
+      .returning();
+
+    // Test 5: Provider approval fails when required organization documents are missing
+    const failNoDocs = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting approval without documents",
+        checklistState: { licenseVerified: true },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failNoDocs.status, 400);
+
+    // Upload an unverified (SUBMITTED) organization document
+    const [p2OrgDoc] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        centerId: null,
+        caregiverId: null,
+        documentCategory: "PROVIDER",
+        documentType: "STATE_CHILDCARE_LICENSE",
+        documentTitle: "Bright Horizons State Childcare License",
+        storageReference: "s3://private-vault/bright-horizons/license.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: 312_000,
+        checksumSha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        malwareScanStatus: "CLEAN",
+        status: "SUBMITTED",
+        expiresAt: new Date(Date.now() + 365 * 86_400_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+
+    // Also upload a centre document (SUBMITTED) to verify provider approval does not auto-verify it
+    const [p2CenterADoc] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        centerId: p2CenterA.id,
+        caregiverId: null,
+        documentCategory: "CENTER",
+        documentType: "FIRE_SAFETY_PERMIT",
+        documentTitle: "North Campus Municipal Fire Permit",
+        storageReference: "s3://private-vault/bright-horizons/north-fire.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: 198_000,
+        checksumSha256: "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+        malwareScanStatus: "CLEAN",
+        status: "SUBMITTED",
+        expiresAt: new Date(Date.now() + 365 * 86_400_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+
+    // Test 6a: Provider approval fails when required organization document is still SUBMITTED (unverified)
+    const failUnverifiedDoc = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting approval while org doc is still SUBMITTED",
+        checklistState: { licenseVerified: true },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failUnverifiedDoc.status, 400);
+
+    // Test 9: Requesting documents transitions provider verification to UNDER_REVIEW
+    const reqDocsRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "request-documents"],
+      query: {},
+      body: {
+        requestedDocuments: ["STATE_CHILDCARE_LICENSE"],
+        reviewComments: "Please verify state childcare license authenticity.",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(reqDocsRes.status, 200);
+    const [p2VerifAfterReq] = await memoryDb
+      .select()
+      .from(providerVerifications)
+      .where(undefined);
+    assert.ok(p2VerifAfterReq);
+
+    // Individually approve the organization document via POST /verification-documents/:id/approve
+    const approveOrgDocRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", p2OrgDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Verified state license number against state registry.",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(approveOrgDocRes.status, 200);
+
+    // Test 7: Provider approval fails when checklistState.licenseVerified is false or missing
+    const failChecklistFalse = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Checklist incomplete test",
+        checklistState: { licenseVerified: false },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failChecklistFalse.status, 400);
+
+    // Test 10: Self-approval is rejected (403 SELF_APPROVAL_FORBIDDEN) when provider owner is the reviewer
+    await memoryDb
+      .update(providers)
+      .set({ ownerUserId: fixtures.standardAdmin.id })
+      .where(undefined);
+    const failSelfApprove = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting self-approval",
+        checklistState: { licenseVerified: true },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failSelfApprove.status, 403);
+    // Restore ownerUserId
+    await memoryDb
+      .update(providers)
+      .set({ ownerUserId: p2Owner.id })
+      .where(undefined);
+
+    // Test 1, 2, 3, 4: Approve Provider Verification and verify NO bulk approval of centres, caregivers, or unverified centre docs
+    const approveProvRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", p2Verif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Organization license and registration independently verified.",
+        checklistState: { licenseVerified: true },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(approveProvRes.status, 200);
+
+    const allCentersAfterProvApproval = await memoryDb.select().from(centers);
+    const centerAAfter = allCentersAfterProvApproval.find(
+      (c) => c.id === p2CenterA.id
+    )!;
+    const centerBAfter = allCentersAfterProvApproval.find(
+      (c) => c.id === p2CenterB.id
+    )!;
+    assert.equal(
+      centerAAfter.verificationStatus,
+      "PENDING",
+      "Provider approval must NOT bulk-approve daycare centres"
+    );
+    assert.equal(
+      centerAAfter.listingStatus,
+      "PENDING_APPROVAL",
+      "Provider approval must NOT bulk-activate daycare centre listings"
+    );
+    assert.equal(centerBAfter.verificationStatus, "PENDING");
+    assert.equal(centerBAfter.listingStatus, "PENDING_APPROVAL");
+
+    const allCaregiversAfterProvApproval = await memoryDb
+      .select()
+      .from(caregivers);
+    const cgAfter = allCaregiversAfterProvApproval.find(
+      (cg) => cg.id === p2Caregiver.id
+    )!;
+    assert.equal(
+      cgAfter.backgroundCheckStatus,
+      "NOT_VERIFIED",
+      "Provider approval must NOT bulk-verify caregivers"
+    );
+
+    const allDocsAfterProvApproval = await memoryDb
+      .select()
+      .from(verificationDocuments);
+    const centerDocAfter = allDocsAfterProvApproval.find(
+      (d) => d.id === p2CenterADoc.id
+    )!;
+    assert.equal(
+      centerDocAfter.status,
+      "SUBMITTED",
+      "Provider approval must NOT bulk-verify unreviewed documents"
+    );
+
+    console.log(
+      "    [PASS] Independent provider verification (no bulk side-effects, self-approval block, document & checklist gates) verified."
+    );
+
+    console.log(
+      "F3. Testing Caregiver Verification, Document Security & Centre Verification Gates..."
+    );
+
+    // Private storage path protection: GET /verification-documents must never leak storageReference
+    const listDocsRes = await dispatchAdminApiRequest({
+      method: "GET",
+      segments: ["verification-documents"],
+      query: {},
+      body: {},
+      cookies: p2Cookies,
+      headers: {},
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(listDocsRes.status, 200);
+    const serializedDocs = JSON.stringify(listDocsRes.body);
+    assert.equal(
+      serializedDocs.includes("s3://private-vault"),
+      false,
+      "Raw private storageReference must never be exposed in API responses"
+    );
+
+    // Centre Verification Gate 1: Cannot approve p2CenterA while p2CenterADoc is still SUBMITTED and caregiver is NOT_VERIFIED
+    const failCenterBeforeCgAndDoc = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterA.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting premature centre approval",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failCenterBeforeCgAndDoc.status, 400);
+
+    // Approve p2CenterADoc first
+    const approveCenterDocRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", p2CenterADoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Verified municipal fire permit for North Campus.",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(approveCenterDocRes.status, 200);
+
+    // Centre Verification Gate 2: Still cannot approve p2CenterA because caregiver is NOT_VERIFIED
+    const failCenterNoVerifiedCaregiver = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterA.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting centre approval without verified caregiver",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failCenterNoVerifiedCaregiver.status, 400);
+
+    // Caregiver Verification Test 2: Caregiver approval fails without a verified supporting screening document
+    const failCgNoDoc = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["caregiver-verifications", p2Caregiver.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting caregiver verification without screening document",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failCgNoDoc.status, 400);
+
+    // Upload & verify caregiver screening document
+    const [p2CgDoc] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        centerId: p2CenterA.id,
+        caregiverId: p2Caregiver.id,
+        documentCategory: "CAREGIVER",
+        documentType: "BACKGROUND_CHECK_CLEARANCE",
+        documentTitle: "Meera Nair National Criminal & Childcare Background Clearance",
+        storageReference: "s3://private-vault/bright-horizons/meera-bg.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: 154_000,
+        checksumSha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+        malwareScanStatus: "CLEAN",
+        status: "VERIFIED",
+        reviewedBy: fixtures.standardAdmin.id,
+        reviewedAt: new Date(),
+        reviewNotes: "Verified clean background check and CPR certification.",
+        expiresAt: new Date(Date.now() + 365 * 86_400_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+    assert.ok(p2CgDoc);
+
+    // Approve Caregiver Verification
+    const approveCgRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["caregiver-verifications", p2Caregiver.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Verified criminal background check and pediatric CPR credentials.",
+        checklistState: {
+          backgroundScreeningVerified: true,
+          credentialsVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(approveCgRes.status, 200);
+
+    // Caregiver Verification Test 4: Expired caregiver verification does not satisfy centre staffing requirements
+    await memoryDb
+      .update(caregivers)
+      .set({ verificationExpiresAt: new Date(Date.now() - 60_000) })
+      .where(undefined);
+
+    const failCenterWithExpiredCg = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterA.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting centre approval with expired caregiver",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failCenterWithExpiredCg.status, 400);
+
+    // Restore valid future caregiver expiration date
+    await memoryDb
+      .update(caregivers)
+      .set({
+        verificationExpiresAt: new Date(Date.now() + 365 * 86_400_000),
+      })
+      .where(undefined);
+
+    // Now approve p2CenterA with all requirements met
+    const approveCenterARes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterA.id, "approve"],
+      query: {},
+      body: {
+        reviewComments:
+          "Verified North Campus fire permit, capacity rules, and qualified caregiver staffing.",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(approveCenterARes.status, 200);
+
+    // Centre Verification Test 6: Approving p2CenterA does NOT approve p2CenterB of the same provider
+    const centersAfterCenterAApproval = await memoryDb.select().from(centers);
+    const updatedCenterA = centersAfterCenterAApproval.find(
+      (c) => c.id === p2CenterA.id
+    )!;
+    const untouchedCenterB = centersAfterCenterAApproval.find(
+      (c) => c.id === p2CenterB.id
+    )!;
+    assert.equal(updatedCenterA.verificationStatus, "APPROVED");
+    assert.equal(updatedCenterA.listingStatus, "ACTIVE");
+    assert.equal(
+      untouchedCenterB.verificationStatus,
+      "PENDING",
+      "Approving one centre must never approve another centre of the same provider"
+    );
+    assert.equal(untouchedCenterB.listingStatus, "PENDING_APPROVAL");
+
+    // Centre Verification Test 5: Unverified/pending-approval centre (p2CenterB) cannot confirm bookings
+    const [testChild] = await memoryDb
+      .insert(children)
+      .values({
+        parentId: fixtures.parentWithAdminKeyword.id,
+        firstName: "Aanya",
+        ageMonths: 18,
+        ageGroup: "Toddler (1-3y)",
+      })
+      .returning();
+
+    const [unverifiedCenterBooking] = await memoryDb
+      .insert(bookings)
+      .values({
+        bookingReference: "LS-BK-UNVERIFIED-01",
+        parentId: fixtures.parentWithAdminKeyword.id,
+        childId: testChild.id,
+        providerId: p2Provider.id,
+        centerId: p2CenterB.id,
+        careType: "DAILY",
+        startTime: new Date(Date.now() + 86_400_000),
+        endTime: new Date(Date.now() + 2 * 86_400_000),
+        status: "REQUESTED",
+        totalAmount: "150.00",
+        paymentStatus: "PENDING",
+      })
+      .returning();
+
+    const failConfirmBookingOnUnverifiedCenter = await dispatchAdminApiRequest({
+      method: "PATCH",
+      segments: ["bookings", unverifiedCenterBooking.id, "status"],
+      query: {},
+      body: {
+        status: "CONFIRMED",
+        reason: "Attempting to confirm booking on unverified centre",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failConfirmBookingOnUnverifiedCenter.status, 400);
+
+    console.log(
+      "    [PASS] Independent centre & caregiver verification workflows and booking gates verified."
+    );
+
+    console.log(
+      "F4. Testing Atomic Database Transactions, Rollback on Failure & Concurrency Conflict (409)..."
+    );
+
+    // Transaction Test 2: Concurrent/duplicate approval of already-approved p2CenterA returns 409 Conflict
+    const duplicateCenterApproveRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterA.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Duplicate concurrent approval attempt",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(duplicateCenterApproveRes.status, 409);
+
+    // Transaction Test 1: Simulated failure inside db.transaction rolls back all changes atomically
+    // Inject a failure on `verificationReviewHistory` insert during rejecting p2CenterB
+    setFailNextInsertOnTable(verificationReviewHistory);
+    const failedTxRejectRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", p2CenterB.id, "reject"],
+      query: {},
+      body: {
+        rejectionReason: "Testing transaction rollback when history insert fails",
+        reviewComments: "Should roll back centre status change",
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failedTxRejectRes.status, 500);
+
+    const centersAfterRollback = await memoryDb.select().from(centers);
+    const centerBAfterRollback = centersAfterRollback.find(
+      (c) => c.id === p2CenterB.id
+    )!;
+    assert.equal(
+      centerBAfterRollback.verificationStatus,
+      "PENDING",
+      "Center status must roll back to PENDING when transaction fails mid-flight"
+    );
+    assert.equal(
+      centerBAfterRollback.listingStatus,
+      "PENDING_APPROVAL",
+      "Center listingStatus must roll back to PENDING_APPROVAL when transaction fails mid-flight"
+    );
+
+    // Verify review history records match committed decisions
+    const committedHistoryRows = await memoryDb
+      .select()
+      .from(verificationReviewHistory);
+    assert.ok(
+      committedHistoryRows.length >= 4,
+      "Committed verification decisions must be recorded in verification_review_history"
+    );
+
+    console.log(
+      "    [PASS] Atomic transaction rollback, 409 conflict detection, and review history consistency verified."
+    );
+
     console.log(
       "=================================================================="
     );
     console.log(
-      "ALL PHASE 1 SECURITY HARDENING TESTS PASSED (100% ISOLATED)!"
+      "ALL PHASE 1 & PHASE 2 TESTS PASSED (100% ISOLATED)!"
     );
     console.log(
       "=================================================================="

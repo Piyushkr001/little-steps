@@ -1,0 +1,3040 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "d6ee321a-823d-4896-bede-bac5f3e9b573",
+  "prevIds": [
+    "fe0635ec-2dac-43bb-9266-826f76fbbba1"
+  ],
+  "footprints": [
+    {
+      "statementType": "create_table",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregiver_verifications"
+      ],
+      "writes": [
+        "s|tbl|public.caregiver_verifications",
+        "n|tbl|public.caregiver_verifications",
+        "e|tbl|public.caregiver_verifications",
+        "n|rel|public.caregiver_verifications",
+        "n|type|public.caregiver_verifications",
+        "n|rel|public.caregiver_verifications_pkey"
+      ],
+      "reads": [
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "create_table",
+      "statementTarget": [
+        "table",
+        "public",
+        "center_verifications"
+      ],
+      "writes": [
+        "s|tbl|public.center_verifications",
+        "n|tbl|public.center_verifications",
+        "e|tbl|public.center_verifications",
+        "n|rel|public.center_verifications",
+        "n|type|public.center_verifications",
+        "n|rel|public.center_verifications_pkey"
+      ],
+      "reads": [
+        "n|sch|public",
+        "n|enum|public.verification_status"
+      ]
+    },
+    {
+      "statementType": "create_table",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_review_history"
+      ],
+      "writes": [
+        "s|tbl|public.verification_review_history",
+        "n|tbl|public.verification_review_history",
+        "e|tbl|public.verification_review_history",
+        "n|rel|public.verification_review_history",
+        "n|type|public.verification_review_history",
+        "n|rel|public.verification_review_history_pkey"
+      ],
+      "reads": [
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "verified_by"
+      ],
+      "writes": [
+        "s|col|public.caregivers.verified_by",
+        "n|col|public.caregivers.verified_by",
+        "e|col|public.caregivers.verified_by"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "verified_at"
+      ],
+      "writes": [
+        "s|col|public.caregivers.verified_at",
+        "n|col|public.caregivers.verified_at",
+        "e|col|public.caregivers.verified_at"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "verification_expires_at"
+      ],
+      "writes": [
+        "s|col|public.caregivers.verification_expires_at",
+        "n|col|public.caregivers.verification_expires_at",
+        "e|col|public.caregivers.verification_expires_at"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "review_comments"
+      ],
+      "writes": [
+        "s|col|public.caregivers.review_comments",
+        "n|col|public.caregivers.review_comments",
+        "e|col|public.caregivers.review_comments"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "rejection_reason"
+      ],
+      "writes": [
+        "s|col|public.caregivers.rejection_reason",
+        "n|col|public.caregivers.rejection_reason",
+        "e|col|public.caregivers.rejection_reason"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "updated_at"
+      ],
+      "writes": [
+        "s|col|public.caregivers.updated_at",
+        "n|col|public.caregivers.updated_at",
+        "e|col|public.caregivers.updated_at"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "verified_by"
+      ],
+      "writes": [
+        "s|col|public.centers.verified_by",
+        "n|col|public.centers.verified_by",
+        "e|col|public.centers.verified_by"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "verified_at"
+      ],
+      "writes": [
+        "s|col|public.centers.verified_at",
+        "n|col|public.centers.verified_at",
+        "e|col|public.centers.verified_at"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "verification_expires_at"
+      ],
+      "writes": [
+        "s|col|public.centers.verification_expires_at",
+        "n|col|public.centers.verification_expires_at",
+        "e|col|public.centers.verification_expires_at"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "review_comments"
+      ],
+      "writes": [
+        "s|col|public.centers.review_comments",
+        "n|col|public.centers.review_comments",
+        "e|col|public.centers.review_comments"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "rejection_reason"
+      ],
+      "writes": [
+        "s|col|public.centers.rejection_reason",
+        "n|col|public.centers.rejection_reason",
+        "e|col|public.centers.rejection_reason"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "caregiver_id"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.caregiver_id",
+        "n|col|public.verification_documents.caregiver_id",
+        "e|col|public.verification_documents.caregiver_id"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "document_category"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.document_category",
+        "n|col|public.verification_documents.document_category",
+        "e|col|public.verification_documents.document_category"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "malware_scan_status"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.malware_scan_status",
+        "n|col|public.verification_documents.malware_scan_status",
+        "e|col|public.verification_documents.malware_scan_status"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "rejection_reason"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.rejection_reason",
+        "n|col|public.verification_documents.rejection_reason",
+        "e|col|public.verification_documents.rejection_reason"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "replacement_requested"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.replacement_requested",
+        "n|col|public.verification_documents.replacement_requested",
+        "e|col|public.verification_documents.replacement_requested"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "updated_at"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.updated_at",
+        "n|col|public.verification_documents.updated_at",
+        "e|col|public.verification_documents.updated_at"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "admin_profiles",
+        "is_approved"
+      ],
+      "writes": [
+        "s|colprop|public.admin_profiles.is_approved.default"
+      ],
+      "reads": [
+        "n|tbl|public.admin_profiles",
+        "n|sch|public",
+        "n|col|public.admin_profiles.is_approved"
+      ],
+      "sqlHash": "07c0ccea72aa4eba"
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "bookings",
+        "payment_status"
+      ],
+      "writes": [
+        "s|colprop|public.bookings.payment_status.default"
+      ],
+      "reads": [
+        "n|tbl|public.bookings",
+        "n|sch|public",
+        "n|col|public.bookings.payment_status"
+      ],
+      "sqlHash": "06e931a2d679fdb1"
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "caregivers",
+        "background_check_status"
+      ],
+      "writes": [
+        "s|colprop|public.caregivers.background_check_status.default"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.caregivers.background_check_status"
+      ],
+      "sqlHash": "f96fb3bddf0b84d1"
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "listing_status"
+      ],
+      "writes": [
+        "s|colprop|public.centers.listing_status.default"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.listing_status",
+        "n|enum|public.center_listing_status"
+      ],
+      "sqlHash": "50b310440f87c45d"
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "centers",
+        "rating"
+      ],
+      "writes": [
+        "s|colprop|public.centers.rating.default"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.rating"
+      ],
+      "sqlHash": "ce1c360d962b3c4c"
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "caregiver_verifications",
+        "caregiver_verifications_caregiver_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.caregiver_verifications_caregiver_id_idx",
+        "n|idx|public.caregiver_verifications_caregiver_id_idx",
+        "e|idx|public.caregiver_verifications_caregiver_id_idx",
+        "n|rel|public.caregiver_verifications_caregiver_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.caregiver_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "caregiver_verifications",
+        "caregiver_verifications_center_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.caregiver_verifications_center_id_idx",
+        "n|idx|public.caregiver_verifications_center_id_idx",
+        "e|idx|public.caregiver_verifications_center_id_idx",
+        "n|rel|public.caregiver_verifications_center_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.center_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "caregiver_verifications",
+        "caregiver_verifications_provider_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.caregiver_verifications_provider_id_idx",
+        "n|idx|public.caregiver_verifications_provider_id_idx",
+        "e|idx|public.caregiver_verifications_provider_id_idx",
+        "n|rel|public.caregiver_verifications_provider_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.provider_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "caregiver_verifications",
+        "caregiver_verifications_status_idx"
+      ],
+      "writes": [
+        "s|idx|public.caregiver_verifications_status_idx",
+        "n|idx|public.caregiver_verifications_status_idx",
+        "e|idx|public.caregiver_verifications_status_idx",
+        "n|rel|public.caregiver_verifications_status_idx"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.status"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "caregivers",
+        "caregivers_bg_status_idx"
+      ],
+      "writes": [
+        "s|idx|public.caregivers_bg_status_idx",
+        "n|idx|public.caregivers_bg_status_idx",
+        "e|idx|public.caregivers_bg_status_idx",
+        "n|rel|public.caregivers_bg_status_idx"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.caregivers.background_check_status"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "center_verifications",
+        "center_verifications_center_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.center_verifications_center_id_idx",
+        "n|idx|public.center_verifications_center_id_idx",
+        "e|idx|public.center_verifications_center_id_idx",
+        "n|rel|public.center_verifications_center_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|col|public.center_verifications.center_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "center_verifications",
+        "center_verifications_provider_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.center_verifications_provider_id_idx",
+        "n|idx|public.center_verifications_provider_id_idx",
+        "e|idx|public.center_verifications_provider_id_idx",
+        "n|rel|public.center_verifications_provider_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|col|public.center_verifications.provider_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "center_verifications",
+        "center_verifications_status_idx"
+      ],
+      "writes": [
+        "s|idx|public.center_verifications_status_idx",
+        "n|idx|public.center_verifications_status_idx",
+        "e|idx|public.center_verifications_status_idx",
+        "n|rel|public.center_verifications_status_idx"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|col|public.center_verifications.status"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "center_verifications",
+        "center_verifications_reviewer_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.center_verifications_reviewer_id_idx",
+        "n|idx|public.center_verifications_reviewer_id_idx",
+        "e|idx|public.center_verifications_reviewer_id_idx",
+        "n|rel|public.center_verifications_reviewer_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|col|public.center_verifications.reviewer_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_documents",
+        "verification_documents_center_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_documents_center_id_idx",
+        "n|idx|public.verification_documents_center_id_idx",
+        "e|idx|public.verification_documents_center_id_idx",
+        "n|rel|public.verification_documents_center_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.center_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_documents",
+        "verification_documents_caregiver_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_documents_caregiver_id_idx",
+        "n|idx|public.verification_documents_caregiver_id_idx",
+        "e|idx|public.verification_documents_caregiver_id_idx",
+        "n|rel|public.verification_documents_caregiver_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.caregiver_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_review_history",
+        "verification_review_history_subject_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_review_history_subject_idx",
+        "n|idx|public.verification_review_history_subject_idx",
+        "e|idx|public.verification_review_history_subject_idx",
+        "n|rel|public.verification_review_history_subject_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_review_history",
+        "n|sch|public",
+        "n|col|public.verification_review_history.subject_type",
+        "n|col|public.verification_review_history.subject_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_review_history",
+        "verification_review_history_verification_id_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_review_history_verification_id_idx",
+        "n|idx|public.verification_review_history_verification_id_idx",
+        "e|idx|public.verification_review_history_verification_id_idx",
+        "n|rel|public.verification_review_history_verification_id_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_review_history",
+        "n|sch|public",
+        "n|col|public.verification_review_history.verification_id"
+      ]
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_review_history",
+        "verification_review_history_created_at_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_review_history_created_at_idx",
+        "n|idx|public.verification_review_history_created_at_idx",
+        "e|idx|public.verification_review_history_created_at_idx",
+        "n|rel|public.verification_review_history_created_at_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_review_history",
+        "n|sch|public",
+        "n|col|public.verification_review_history.created_at"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregiver_verifications"
+      ],
+      "writes": [
+        "s|fk|public.caregiver_verifications.caregiver_verifications_caregiver_id_caregivers_id_fkey",
+        "n|fk|public.caregiver_verifications.caregiver_verifications_caregiver_id_caregivers_id_fkey",
+        "e|fk|public.caregiver_verifications.caregiver_verifications_caregiver_id_caregivers_id_fkey",
+        "n|con|public.caregiver_verifications.caregiver_verifications_caregiver_id_caregivers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.caregiver_id",
+        "n|col|public.caregivers.id",
+        "e|uniqueness|public.caregivers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregiver_verifications"
+      ],
+      "writes": [
+        "s|fk|public.caregiver_verifications.caregiver_verifications_center_id_centers_id_fkey",
+        "n|fk|public.caregiver_verifications.caregiver_verifications_center_id_centers_id_fkey",
+        "e|fk|public.caregiver_verifications.caregiver_verifications_center_id_centers_id_fkey",
+        "n|con|public.caregiver_verifications.caregiver_verifications_center_id_centers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.center_id",
+        "n|col|public.centers.id",
+        "e|uniqueness|public.centers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregiver_verifications"
+      ],
+      "writes": [
+        "s|fk|public.caregiver_verifications.caregiver_verifications_provider_id_providers_id_fkey",
+        "n|fk|public.caregiver_verifications.caregiver_verifications_provider_id_providers_id_fkey",
+        "e|fk|public.caregiver_verifications.caregiver_verifications_provider_id_providers_id_fkey",
+        "n|con|public.caregiver_verifications.caregiver_verifications_provider_id_providers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|tbl|public.providers",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.provider_id",
+        "n|col|public.providers.id",
+        "e|uniqueness|public.providers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregiver_verifications"
+      ],
+      "writes": [
+        "s|fk|public.caregiver_verifications.caregiver_verifications_reviewer_id_users_id_fkey",
+        "n|fk|public.caregiver_verifications.caregiver_verifications_reviewer_id_users_id_fkey",
+        "e|fk|public.caregiver_verifications.caregiver_verifications_reviewer_id_users_id_fkey",
+        "n|con|public.caregiver_verifications.caregiver_verifications_reviewer_id_users_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.caregiver_verifications",
+        "n|sch|public",
+        "n|tbl|public.users",
+        "n|sch|public",
+        "n|col|public.caregiver_verifications.reviewer_id",
+        "n|col|public.users.id",
+        "e|uniqueness|public.users.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregivers"
+      ],
+      "writes": [
+        "s|fk|public.caregivers.caregivers_verified_by_users_id_fkey",
+        "n|fk|public.caregivers.caregivers_verified_by_users_id_fkey",
+        "e|fk|public.caregivers.caregivers_verified_by_users_id_fkey",
+        "n|con|public.caregivers.caregivers_verified_by_users_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|tbl|public.users",
+        "n|sch|public",
+        "n|col|public.caregivers.verified_by",
+        "n|col|public.users.id",
+        "e|uniqueness|public.users.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "center_verifications"
+      ],
+      "writes": [
+        "s|fk|public.center_verifications.center_verifications_center_id_centers_id_fkey",
+        "n|fk|public.center_verifications.center_verifications_center_id_centers_id_fkey",
+        "e|fk|public.center_verifications.center_verifications_center_id_centers_id_fkey",
+        "n|con|public.center_verifications.center_verifications_center_id_centers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.center_verifications.center_id",
+        "n|col|public.centers.id",
+        "e|uniqueness|public.centers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "center_verifications"
+      ],
+      "writes": [
+        "s|fk|public.center_verifications.center_verifications_provider_id_providers_id_fkey",
+        "n|fk|public.center_verifications.center_verifications_provider_id_providers_id_fkey",
+        "e|fk|public.center_verifications.center_verifications_provider_id_providers_id_fkey",
+        "n|con|public.center_verifications.center_verifications_provider_id_providers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|tbl|public.providers",
+        "n|sch|public",
+        "n|col|public.center_verifications.provider_id",
+        "n|col|public.providers.id",
+        "e|uniqueness|public.providers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "center_verifications"
+      ],
+      "writes": [
+        "s|fk|public.center_verifications.center_verifications_reviewer_id_users_id_fkey",
+        "n|fk|public.center_verifications.center_verifications_reviewer_id_users_id_fkey",
+        "e|fk|public.center_verifications.center_verifications_reviewer_id_users_id_fkey",
+        "n|con|public.center_verifications.center_verifications_reviewer_id_users_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.center_verifications",
+        "n|sch|public",
+        "n|tbl|public.users",
+        "n|sch|public",
+        "n|col|public.center_verifications.reviewer_id",
+        "n|col|public.users.id",
+        "e|uniqueness|public.users.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|fk|public.centers.centers_verified_by_users_id_fkey",
+        "n|fk|public.centers.centers_verified_by_users_id_fkey",
+        "e|fk|public.centers.centers_verified_by_users_id_fkey",
+        "n|con|public.centers.centers_verified_by_users_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|tbl|public.users",
+        "n|sch|public",
+        "n|col|public.centers.verified_by",
+        "n|col|public.users.id",
+        "e|uniqueness|public.users.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|fk|public.verification_documents.verification_documents_caregiver_id_caregivers_id_fkey",
+        "n|fk|public.verification_documents.verification_documents_caregiver_id_caregivers_id_fkey",
+        "e|fk|public.verification_documents.verification_documents_caregiver_id_caregivers_id_fkey",
+        "n|con|public.verification_documents.verification_documents_caregiver_id_caregivers_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.verification_documents.caregiver_id",
+        "n|col|public.caregivers.id",
+        "e|uniqueness|public.caregivers.id"
+      ]
+    },
+    {
+      "statementType": "create_fk",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_review_history"
+      ],
+      "writes": [
+        "s|fk|public.verification_review_history.verification_review_history_reviewer_id_users_id_fkey",
+        "n|fk|public.verification_review_history.verification_review_history_reviewer_id_users_id_fkey",
+        "e|fk|public.verification_review_history.verification_review_history_reviewer_id_users_id_fkey",
+        "n|con|public.verification_review_history.verification_review_history_reviewer_id_users_id_fkey"
+      ],
+      "reads": [
+        "n|tbl|public.verification_review_history",
+        "n|sch|public",
+        "n|tbl|public.users",
+        "n|sch|public",
+        "n|col|public.verification_review_history.reviewer_id",
+        "n|col|public.users.id",
+        "e|uniqueness|public.users.id"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "bookings"
+      ],
+      "writes": [
+        "s|ck|public.bookings.bookings_total_amount_nonneg",
+        "n|ck|public.bookings.bookings_total_amount_nonneg",
+        "e|ck|public.bookings.bookings_total_amount_nonneg",
+        "n|con|public.bookings.bookings_total_amount_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.bookings",
+        "n|sch|public",
+        "n|col|public.bookings.total_amount"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "bookings"
+      ],
+      "writes": [
+        "s|ck|public.bookings.bookings_valid_time_range",
+        "n|ck|public.bookings.bookings_valid_time_range",
+        "e|ck|public.bookings.bookings_valid_time_range",
+        "n|con|public.bookings.bookings_valid_time_range"
+      ],
+      "reads": [
+        "n|tbl|public.bookings",
+        "n|sch|public",
+        "n|col|public.bookings.end_time",
+        "n|col|public.bookings.start_time"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "bookings"
+      ],
+      "writes": [
+        "s|ck|public.bookings.bookings_payment_status_valid",
+        "n|ck|public.bookings.bookings_payment_status_valid",
+        "e|ck|public.bookings.bookings_payment_status_valid",
+        "n|con|public.bookings.bookings_payment_status_valid"
+      ],
+      "reads": [
+        "n|tbl|public.bookings",
+        "n|sch|public",
+        "n|col|public.bookings.payment_status"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "capacity_rules"
+      ],
+      "writes": [
+        "s|ck|public.capacity_rules.capacity_rules_max_children_pos",
+        "n|ck|public.capacity_rules.capacity_rules_max_children_pos",
+        "e|ck|public.capacity_rules.capacity_rules_max_children_pos",
+        "n|con|public.capacity_rules.capacity_rules_max_children_pos"
+      ],
+      "reads": [
+        "n|tbl|public.capacity_rules",
+        "n|sch|public",
+        "n|col|public.capacity_rules.max_children"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregivers"
+      ],
+      "writes": [
+        "s|ck|public.caregivers.caregivers_years_exp_nonneg",
+        "n|ck|public.caregivers.caregivers_years_exp_nonneg",
+        "e|ck|public.caregivers.caregivers_years_exp_nonneg",
+        "n|con|public.caregivers.caregivers_years_exp_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.caregivers.years_experience"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "caregivers"
+      ],
+      "writes": [
+        "s|ck|public.caregivers.caregivers_bg_status_valid",
+        "n|ck|public.caregivers.caregivers_bg_status_valid",
+        "e|ck|public.caregivers.caregivers_bg_status_valid",
+        "n|con|public.caregivers.caregivers_bg_status_valid"
+      ],
+      "reads": [
+        "n|tbl|public.caregivers",
+        "n|sch|public",
+        "n|col|public.caregivers.background_check_status"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|ck|public.centers.centers_approved_capacity_nonneg",
+        "n|ck|public.centers.centers_approved_capacity_nonneg",
+        "e|ck|public.centers.centers_approved_capacity_nonneg",
+        "n|con|public.centers.centers_approved_capacity_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.approved_capacity"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|ck|public.centers.centers_current_occupancy_nonneg",
+        "n|ck|public.centers.centers_current_occupancy_nonneg",
+        "e|ck|public.centers.centers_current_occupancy_nonneg",
+        "n|con|public.centers.centers_current_occupancy_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.current_occupancy"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|ck|public.centers.centers_hourly_rate_nonneg",
+        "n|ck|public.centers.centers_hourly_rate_nonneg",
+        "e|ck|public.centers.centers_hourly_rate_nonneg",
+        "n|con|public.centers.centers_hourly_rate_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.hourly_rate"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|ck|public.centers.centers_daily_rate_nonneg",
+        "n|ck|public.centers.centers_daily_rate_nonneg",
+        "e|ck|public.centers.centers_daily_rate_nonneg",
+        "n|con|public.centers.centers_daily_rate_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.daily_rate"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "centers"
+      ],
+      "writes": [
+        "s|ck|public.centers.centers_rating_range_chk",
+        "n|ck|public.centers.centers_rating_range_chk",
+        "e|ck|public.centers.centers_rating_range_chk",
+        "n|con|public.centers.centers_rating_range_chk"
+      ],
+      "reads": [
+        "n|tbl|public.centers",
+        "n|sch|public",
+        "n|col|public.centers.rating"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|ck|public.verification_documents.verification_documents_size_nonneg",
+        "n|ck|public.verification_documents.verification_documents_size_nonneg",
+        "e|ck|public.verification_documents.verification_documents_size_nonneg",
+        "n|con|public.verification_documents.verification_documents_size_nonneg"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.file_size_bytes"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|ck|public.verification_documents.verification_documents_status_valid",
+        "n|ck|public.verification_documents.verification_documents_status_valid",
+        "e|ck|public.verification_documents.verification_documents_status_valid",
+        "n|con|public.verification_documents.verification_documents_status_valid"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.status"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "name": "caregiver_verifications",
+        "isRlsEnabled": false,
+        "entityType": "tables"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "name": "center_verifications",
+        "isRlsEnabled": false,
+        "entityType": "tables"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "name": "verification_review_history",
+        "isRlsEnabled": false,
+        "entityType": "tables"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "gen_random_uuid()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "center_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "provider_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "status",
+        "type": "varchar(50)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'NOT_VERIFIED'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "reviewer_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "submitted_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "reviewed_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "review_comments",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "document_references",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'[]'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "checklist_state",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'{}'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "expires_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "verified_by",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "verified_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "verification_expires_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "review_comments",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "gen_random_uuid()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "provider_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "status",
+        "type": "verification_status",
+        "typeSchema": "public",
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'PENDING'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "reviewer_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "submitted_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "reviewed_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "review_comments",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "requested_documents",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'[]'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "document_references",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'[]'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "checklist_state",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'{}'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "safety_compliance_notes",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "expires_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "verified_by",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "verified_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "verification_expires_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "review_comments",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "caregiver_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "document_category",
+        "type": "varchar(60)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'PROVIDER'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "malware_scan_status",
+        "type": "varchar(50)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'CLEAN'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "replacement_requested",
+        "type": "boolean",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "false",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "gen_random_uuid()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "subject_type",
+        "type": "varchar(50)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "subject_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "previous_status",
+        "type": "varchar(50)",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "new_status",
+        "type": "varchar(50)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "decision",
+        "type": "varchar(60)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "reviewer_id",
+        "type": "uuid",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "reviewer_email",
+        "type": "varchar(255)",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "review_comments",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "rejection_reason",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "evidence_snapshot",
+        "type": "jsonb",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "'{}'",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": true,
+        "dimensions": 0,
+        "default": "now()",
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_caregiver_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "caregiver_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_center_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "center_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_provider_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "provider_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_status_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "status",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "caregivers_bg_status_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "background_check_status",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_center_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "center_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_provider_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "provider_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_status_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "status",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_reviewer_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "reviewer_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_center_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "center_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_caregiver_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "caregiver_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_subject_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "subject_type",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          },
+          {
+            "value": "subject_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_verification_id_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "verification_id",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_created_at_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "created_at",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_caregiver_id_caregivers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "caregiver_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "caregivers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "CASCADE",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_center_id_centers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "center_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "centers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "CASCADE",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_provider_id_providers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "provider_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "providers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "CASCADE",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_reviewer_id_users_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "reviewer_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "users",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "caregivers_verified_by_users_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "verified_by"
+        ],
+        "schemaTo": "public",
+        "tableTo": "users",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_center_id_centers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "center_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "centers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "CASCADE",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_provider_id_providers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "provider_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "providers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "CASCADE",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_reviewer_id_users_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "reviewer_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "users",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_verified_by_users_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "verified_by"
+        ],
+        "schemaTo": "public",
+        "tableTo": "users",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_caregiver_id_caregivers_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "caregiver_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "caregivers",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_reviewer_id_users_id_fkey",
+        "nameExplicit": false,
+        "columns": [
+          "reviewer_id"
+        ],
+        "schemaTo": "public",
+        "tableTo": "users",
+        "columnsTo": [
+          "id"
+        ],
+        "onUpdate": "NO ACTION",
+        "onDelete": "SET NULL",
+        "entityType": "fks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_pkey",
+        "columns": [
+          "id"
+        ],
+        "nameExplicit": false,
+        "entityType": "pks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "center_verifications",
+        "name": "center_verifications_pkey",
+        "columns": [
+          "id"
+        ],
+        "nameExplicit": false,
+        "entityType": "pks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_pkey",
+        "columns": [
+          "id"
+        ],
+        "nameExplicit": false,
+        "entityType": "pks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "bookings",
+        "name": "bookings_total_amount_nonneg",
+        "value": "\"total_amount\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "bookings",
+        "name": "bookings_valid_time_range",
+        "value": "\"end_time\" > \"start_time\"",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "bookings",
+        "name": "bookings_payment_status_valid",
+        "value": "\"payment_status\" IN ('UNPAID', 'PENDING', 'PAID', 'PARTIALLY_REFUNDED', 'REFUNDED', 'DISPUTED', 'FAILED')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "capacity_rules",
+        "name": "capacity_rules_max_children_pos",
+        "value": "\"max_children\" > 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregiver_verifications",
+        "name": "caregiver_verifications_status_valid",
+        "value": "\"status\" IN ('NOT_VERIFIED', 'PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED', 'SUSPENDED')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "caregivers_years_exp_nonneg",
+        "value": "\"years_experience\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "caregivers",
+        "name": "caregivers_bg_status_valid",
+        "value": "\"background_check_status\" IN ('NOT_VERIFIED', 'PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED', 'SUSPENDED')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_approved_capacity_nonneg",
+        "value": "\"approved_capacity\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_current_occupancy_nonneg",
+        "value": "\"current_occupancy\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_hourly_rate_nonneg",
+        "value": "\"hourly_rate\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_daily_rate_nonneg",
+        "value": "\"daily_rate\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "centers",
+        "name": "centers_rating_range_chk",
+        "value": "\"rating\" IS NULL OR (\"rating\" >= 0 AND \"rating\" <= 5)",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_size_nonneg",
+        "value": "\"file_size_bytes\" >= 0",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_status_valid",
+        "value": "\"status\" IN ('SUBMITTED', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_review_history",
+        "name": "verification_review_history_subject_type_valid",
+        "value": "\"subject_type\" IN ('PROVIDER', 'CENTER', 'CAREGIVER', 'DOCUMENT')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"admin_profiles\",\"is_approved\"]",
+      "set": {
+        "default": "false"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"bookings\",\"payment_status\"]",
+      "set": {
+        "default": "'PENDING'"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"caregivers\",\"background_check_status\"]",
+      "set": {
+        "default": "'NOT_VERIFIED'"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"centers\",\"listing_status\"]",
+      "set": {
+        "default": "'PENDING_APPROVAL'"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"centers\",\"rating\"]",
+      "set": {
+        "default": null
+      }
+    }
+  ]
+}

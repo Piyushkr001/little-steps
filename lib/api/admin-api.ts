@@ -3,14 +3,17 @@ import type {
   ApiSuccessResponse,
   AuthenticatedAdmin,
   BookingStatus,
+  CaregiverVerificationStatus,
   CenterListingStatus,
   DashboardActivity,
   DashboardAnalytics,
   DashboardStats,
+  DocumentVerificationStatus,
   IncidentSeverity,
   IncidentStatus,
   UserRole,
   VerificationStatus,
+  VerificationSubjectType,
 } from "@/lib/admin/types";
 import { adminAxiosClient } from "./axios-client";
 
@@ -232,8 +235,52 @@ export const providers = {
 };
 
 // ==========================================
-// 5. verifications module
+// 5. verifications, centerVerifications, caregiverVerifications, verificationDocuments modules
 // ==========================================
+export interface AdminVerificationReviewHistoryItem {
+  id: string;
+  subjectType: VerificationSubjectType;
+  subjectId: string;
+  action: string;
+  previousStatus: string | null;
+  newStatus: string;
+  reviewerId: string | null;
+  reviewerName: string | null;
+  reviewerEmail: string | null;
+  reviewComments: string | null;
+  rejectionReason: string | null;
+  createdAt: string;
+}
+
+export interface AdminVerificationDocumentItem {
+  id: string;
+  providerId: string;
+  providerName?: string;
+  centerId: string | null;
+  centerName?: string | null;
+  caregiverId: string | null;
+  caregiverName?: string | null;
+  verificationId: string | null;
+  documentType: string;
+  documentTitle: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  checksumSha256: string | null;
+  malwareScanStatus: string;
+  status: DocumentVerificationStatus | string;
+  isExpired: boolean;
+  expiresAt: string | null;
+  reviewedBy: string | null;
+  reviewerName: string | null;
+  reviewedAt: string | null;
+  reviewNotes: string | null;
+  rejectionReason: string | null;
+  replacementRequested: boolean;
+  accessDescriptor?: string;
+  reviewHistory?: AdminVerificationReviewHistoryItem[];
+  createdAt?: string;
+}
+
 export interface AdminVerificationItem {
   id: string;
   providerId: string;
@@ -254,25 +301,111 @@ export interface AdminVerificationItem {
   rejectionReason: string | null;
   requestedDocuments: string[];
   checklistState: Record<string, boolean>;
+  approvalEligibility?: {
+    eligible: boolean;
+    reasons: string[];
+    requiredChecklistKeys?: readonly string[];
+  };
   centers: Array<{
     id: string;
     name: string;
     city: string;
     approvedCapacity: number;
     is24x7: boolean;
+    verificationStatus?: VerificationStatus;
     listingStatus: CenterListingStatus;
+    verifiedAt?: string | null;
   }>;
-  documents: Array<{
+  caregivers?: Array<{
     id: string;
-    documentType: string;
-    documentTitle: string;
-    mimeType: string;
-    fileSizeBytes: number;
-    status: string;
-    checksumSha256: string | null;
-    expiresAt: string | null;
-    reviewNotes: string | null;
+    centerId: string;
+    fullName: string;
+    roleTitle: string;
+    backgroundCheckStatus: CaregiverVerificationStatus | string;
+    isActive: boolean;
+    verifiedAt: string | null;
+    verificationExpiresAt: string | null;
   }>;
+  documents: AdminVerificationDocumentItem[];
+  reviewHistory?: AdminVerificationReviewHistoryItem[];
+}
+
+export interface AdminCenterVerificationItem {
+  id: string;
+  centerId: string;
+  providerId: string;
+  providerName: string;
+  providerVerificationStatus: VerificationStatus;
+  centerName: string;
+  city: string;
+  state: string;
+  address: string;
+  approvedCapacity: number;
+  ageGroupsSupported: string[];
+  is24x7: boolean;
+  verificationStatus: VerificationStatus;
+  listingStatus: CenterListingStatus;
+  reviewerId: string | null;
+  reviewerName: string | null;
+  reviewerEmail: string | null;
+  submittedAt: string;
+  reviewedAt: string | null;
+  verificationExpiresAt: string | null;
+  reviewComments: string | null;
+  rejectionReason: string | null;
+  requestedDocuments: string[];
+  checklistState: Record<string, boolean>;
+  approvalEligibility: {
+    eligible: boolean;
+    reasons: string[];
+    eligibleCaregiversCount: number;
+  };
+  caregivers: Array<{
+    id: string;
+    fullName: string;
+    email: string;
+    roleTitle: string;
+    backgroundCheckStatus: CaregiverVerificationStatus | string;
+    isExpired: boolean;
+    isActive: boolean;
+    verifiedAt: string | null;
+    verificationExpiresAt: string | null;
+  }>;
+  documents: AdminVerificationDocumentItem[];
+  reviewHistory: AdminVerificationReviewHistoryItem[];
+}
+
+export interface AdminCaregiverVerificationItem {
+  id: string;
+  caregiverId: string;
+  centerId: string;
+  centerName: string;
+  providerId: string;
+  providerName: string;
+  fullName: string;
+  email: string;
+  phone: string | null;
+  roleTitle: string;
+  certifications: string[];
+  yearsExperience: number;
+  isActive: boolean;
+  backgroundCheckStatus: CaregiverVerificationStatus;
+  rawBackgroundCheckStatus: CaregiverVerificationStatus;
+  isExpired: boolean;
+  verifiedBy: string | null;
+  reviewerName: string | null;
+  reviewerEmail: string | null;
+  verifiedAt: string | null;
+  verificationExpiresAt: string | null;
+  reviewComments: string | null;
+  rejectionReason: string | null;
+  checklistState: Record<string, boolean>;
+  approvalEligibility: {
+    eligible: boolean;
+    reasons: string[];
+  };
+  documents: AdminVerificationDocumentItem[];
+  reviewHistory: AdminVerificationReviewHistoryItem[];
 }
 
 export const verifications = {
@@ -324,6 +457,174 @@ export const verifications = {
   },
 };
 
+export const centerVerifications = {
+  async list(params?: {
+    status?: string;
+    search?: string;
+    providerId?: string;
+  }) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminCenterVerificationItem[]>
+    >("/admin/center-verifications", { params });
+    return data.data;
+  },
+
+  async getById(id: string) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminCenterVerificationItem>
+    >(`/admin/center-verifications/${id}`);
+    return data.data;
+  },
+
+  async approve(
+    centerId: string,
+    payload: {
+      reviewComments: string;
+      checklistState: {
+        operatingLicenseVerified: boolean;
+        facilitySafetyVerified: boolean;
+        caregiverQualificationVerified: boolean;
+        capacityVerified: boolean;
+      };
+      verificationExpiresAt?: string;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/center-verifications/${centerId}/approve`,
+      payload
+    );
+    return data.data;
+  },
+
+  async reject(
+    centerId: string,
+    payload: {
+      rejectionReason: string;
+      reviewComments?: string;
+      suspendCenter?: boolean;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/center-verifications/${centerId}/reject`,
+      payload
+    );
+    return data.data;
+  },
+
+  async requestDocuments(
+    centerId: string,
+    payload: { requestedDocuments: string[]; reviewComments: string }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/center-verifications/${centerId}/request-documents`,
+      payload
+    );
+    return data.data;
+  },
+};
+
+export const caregiverVerifications = {
+  async list(params?: {
+    status?: string;
+    search?: string;
+    providerId?: string;
+    centerId?: string;
+  }) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminCaregiverVerificationItem[]>
+    >("/admin/caregiver-verifications", { params });
+    return data.data;
+  },
+
+  async getById(id: string) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminCaregiverVerificationItem>
+    >(`/admin/caregiver-verifications/${id}`);
+    return data.data;
+  },
+
+  async approve(
+    caregiverId: string,
+    payload: {
+      reviewComments: string;
+      verificationExpiresAt?: string;
+      checklistState?: Record<string, boolean>;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/caregiver-verifications/${caregiverId}/approve`,
+      payload
+    );
+    return data.data;
+  },
+
+  async reject(
+    caregiverId: string,
+    payload: {
+      rejectionReason: string;
+      reviewComments?: string;
+      suspendCaregiver?: boolean;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/caregiver-verifications/${caregiverId}/reject`,
+      payload
+    );
+    return data.data;
+  },
+};
+
+export const verificationDocuments = {
+  async list(params?: {
+    status?: string;
+    providerId?: string;
+    centerId?: string;
+    caregiverId?: string;
+    search?: string;
+  }) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminVerificationDocumentItem[]>
+    >("/admin/verification-documents", { params });
+    return data.data;
+  },
+
+  async getById(id: string) {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminVerificationDocumentItem>
+    >(`/admin/verification-documents/${id}`);
+    return data.data;
+  },
+
+  async approve(
+    documentId: string,
+    payload?: {
+      reviewComments?: string;
+      expiresAt?: string;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/verification-documents/${documentId}/approve`,
+      payload ?? {}
+    );
+    return data.data;
+  },
+
+  async reject(
+    documentId: string,
+    payload: {
+      rejectionReason: string;
+      reviewComments?: string;
+      replacementRequested?: boolean;
+    }
+  ) {
+    const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
+      `/admin/verification-documents/${documentId}/reject`,
+      payload
+    );
+    return data.data;
+  },
+};
+
 // ==========================================
 // 6. centers module
 // ==========================================
@@ -331,6 +632,7 @@ export interface AdminCenterListItem {
   id: string;
   providerId: string;
   providerName: string;
+  providerVerificationStatus?: VerificationStatus;
   name: string;
   slug: string;
   description: string | null;
@@ -352,14 +654,25 @@ export interface AdminCenterListItem {
   dailyRate: string;
   verificationStatus: VerificationStatus;
   listingStatus: CenterListingStatus;
+  verifiedBy?: string | null;
+  verifiedAt?: string | null;
+  verificationExpiresAt?: string | null;
+  reviewComments?: string | null;
+  rejectionReason?: string | null;
   suspendedReason: string | null;
   rating: string | null;
   caregiversCount: number;
+  verifiedCaregiversCount?: number;
   openIncidentsCount: number;
   createdAt: string;
 }
 
 export interface AdminCenterDetail extends AdminCenterListItem {
+  approvalEligibility?: {
+    eligible: boolean;
+    reasons: string[];
+    eligibleCaregiversCount: number;
+  };
   caregivers: Array<{
     id: string;
     fullName: string;
@@ -370,7 +683,14 @@ export interface AdminCenterDetail extends AdminCenterListItem {
     backgroundCheckStatus: string;
     yearsExperience: number;
     isActive: boolean;
+    verifiedBy?: string | null;
+    verifiedAt?: string | null;
+    verificationExpiresAt?: string | null;
+    reviewComments?: string | null;
+    rejectionReason?: string | null;
   }>;
+  documents?: AdminVerificationDocumentItem[];
+  reviewHistory?: AdminVerificationReviewHistoryItem[];
   capacityRules: Array<{
     id: string;
     ageGroup: string;

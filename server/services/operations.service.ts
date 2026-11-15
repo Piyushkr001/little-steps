@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
-import { db } from "../../config/db";
+import { type AppDatabase, db } from "../../config/db";
 import {
   adminAuditLogs,
   adminProfiles,
@@ -8,7 +8,9 @@ import {
   bookingStatusHistory,
   capacityRules,
   caregivers,
+  caregiverVerifications,
   centers,
+  centerVerifications,
   children,
   disputes,
   incidentActivity,
@@ -19,17 +21,125 @@ import {
   userRoles,
   users,
   verificationDocuments,
+  verificationReviewHistory,
 } from "../../config/schema";
 import type {
   AccountStatus,
   AuthenticatedAdmin,
   BookingStatus,
+  CaregiverVerificationStatus,
   CenterListingStatus,
+  DocumentVerificationStatus,
   IncidentStatus,
+  VerificationStatus,
 } from "../../lib/admin/types";
 import { ALLOWED_BOOKING_TRANSITIONS } from "../../lib/admin/validation";
 import { AdminAuthError } from "./admin-auth.service";
 import { recordAdminAuditLog } from "./audit.service";
+
+const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
+  "application/pdf",
+  "image/png",
+  "image/jpeg",
+]);
+const MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+export function isDocumentCurrentlyValid(
+  doc: {
+    status: string;
+    expiresAt: Date | null;
+    malwareScanStatus?: string | null;
+  },
+  now = new Date()
+): boolean {
+  if (doc.status !== "VERIFIED") return false;
+  if (doc.malwareScanStatus && doc.malwareScanStatus !== "CLEAN") return false;
+  if (doc.expiresAt && doc.expiresAt <= now) return false;
+  return true;
+}
+
+export function isCaregiverEligibleForStaffing(
+  caregiver: {
+    isActive: boolean;
+    backgroundCheckStatus: string;
+    verificationExpiresAt?: Date | null;
+  },
+  now = new Date()
+): boolean {
+  if (!caregiver.isActive) return false;
+  if (caregiver.backgroundCheckStatus !== "VERIFIED") return false;
+  if (
+    caregiver.verificationExpiresAt &&
+    caregiver.verificationExpiresAt <= now
+  ) {
+    return false;
+  }
+  return true;
+}
+
+export function getEffectiveCaregiverStatus(
+  caregiver: {
+    isActive: boolean;
+    backgroundCheckStatus: string;
+    verificationExpiresAt?: Date | null;
+  },
+  now = new Date()
+): CaregiverVerificationStatus {
+  if (
+    caregiver.backgroundCheckStatus === "VERIFIED" &&
+    caregiver.verificationExpiresAt &&
+    caregiver.verificationExpiresAt <= now
+  ) {
+    return "EXPIRED";
+  }
+  return (caregiver.backgroundCheckStatus ||
+    "NOT_VERIFIED") as CaregiverVerificationStatus;
+}
+
+function buildPrivateDocumentAccessDescriptor(docId: string): string {
+  return `/api/v1/admin/verification-documents/${docId}`;
+}
+
+async function safeSelectTable<T>(queryFn: () => Promise<T[]>): Promise<T[]> {
+  try {
+    return await queryFn();
+  } catch {
+    return [];
+  }
+}
+
+async function appendVerificationReviewHistory(
+  tx: Pick<AppDatabase, "insert">,
+  entry: {
+    subjectType: "PROVIDER" | "CENTER" | "CAREGIVER" | "DOCUMENT";
+    subjectId: string;
+    verificationId?: string | null;
+    previousStatus?: string | null;
+    newStatus: string;
+    decision: string;
+    reviewerId: string;
+    reviewerEmail: string;
+    reviewComments?: string | null;
+    rejectionReason?: string | null;
+    evidenceSnapshot?: Record<string, unknown>;
+    createdAt?: Date;
+  }
+): Promise<void> {
+  await tx.insert(verificationReviewHistory).values({
+    subjectType: entry.subjectType,
+    subjectId: entry.subjectId,
+    verificationId: entry.verificationId ?? null,
+    previousStatus: entry.previousStatus ?? null,
+    newStatus: entry.newStatus,
+    decision: entry.decision,
+    reviewerId: entry.reviewerId,
+    reviewerEmail: entry.reviewerEmail,
+    reviewComments: entry.reviewComments ?? null,
+    rejectionReason: entry.rejectionReason ?? null,
+    evidenceSnapshot: entry.evidenceSnapshot ?? {},
+    createdAt: entry.createdAt ?? new Date(),
+  });
+}
 
 // ==========================================
 // 1. User Management
@@ -438,26 +548,183 @@ export async function getAdminProviderById(providerId: string) {
   };
 }
 
+export function evaluateProviderApprovalEligibility(params: {
+  provider: {
+    id: string;
+    ownerUserId: string;
+    organizationName: string;
+    registrationNumber: string;
+    contactEmail: string;
+    contactPhone: string;
+    address: string;
+  };
+  verification: {
+    id: string;
+    status: string;
+    requestedDocuments: string[] | null;
+    documentReferences: string[] | null;
+    checklistState: Record<string, boolean> | null;
+  };
+  providerDocuments: Array<{
+    id: string;
+    providerId: string;
+    centerId: string | null;
+    caregiverId?: string | null;
+    documentCategory?: string | null;
+    documentType: string;
+    documentTitle: string;
+    status: string;
+    expiresAt: Date | null;
+    malwareScanStatus?: string | null;
+  }>;
+  submittedChecklist?: Record<string, boolean>;
+  now?: Date;
+}) {
+  const now = params.now ?? new Date();
+  const blockingReasons: string[] = [];
+
+  if (
+    params.verification.status !== "PENDING" &&
+    params.verification.status !== "UNDER_REVIEW"
+  ) {
+    blockingReasons.push(
+      `Provider verification is currently '${params.verification.status}' and is not in a reviewable state (PENDING or UNDER_REVIEW).`
+    );
+  }
+
+  // Organization-scoped documents (exclude caregiver-only documents)
+  const orgDocs = params.providerDocuments.filter((d) => !d.caregiverId);
+
+  if (orgDocs.length === 0) {
+    blockingReasons.push(
+      "At least one organization verification document (e.g., childcare license or registration certificate) must be submitted."
+    );
+  }
+
+  const referencedIds = params.verification.documentReferences ?? [];
+  const requiredDocsToInspect =
+    referencedIds.length > 0
+      ? orgDocs.filter((d) => referencedIds.includes(d.id))
+      : orgDocs.filter((d) => !d.centerId).length > 0
+        ? orgDocs.filter((d) => !d.centerId)
+        : orgDocs;
+
+  if (referencedIds.length > 0 && requiredDocsToInspect.length < referencedIds.length) {
+    blockingReasons.push(
+      "One or more referenced verification documents could not be found."
+    );
+  }
+
+  const rejectedDocs = requiredDocsToInspect.filter(
+    (d) => d.status === "REJECTED"
+  );
+  if (rejectedDocs.length > 0) {
+    blockingReasons.push(
+      `Rejected organization document(s) cannot satisfy approval: ${rejectedDocs.map((d) => d.documentTitle).join(", ")}.`
+    );
+  }
+
+  const expiredDocs = requiredDocsToInspect.filter(
+    (d) => d.status === "EXPIRED" || (d.expiresAt !== null && d.expiresAt <= now)
+  );
+  if (expiredDocs.length > 0) {
+    blockingReasons.push(
+      `Expired organization document(s) must be renewed before approval: ${expiredDocs.map((d) => d.documentTitle).join(", ")}.`
+    );
+  }
+
+  const unverifiedDocs = requiredDocsToInspect.filter(
+    (d) => d.status !== "VERIFIED" && d.status !== "REJECTED" && d.status !== "EXPIRED"
+  );
+  if (unverifiedDocs.length > 0) {
+    blockingReasons.push(
+      `All required organization documents must be individually VERIFIED before provider approval (${unverifiedDocs.length} unverified: ${unverifiedDocs.map((d) => d.documentTitle).join(", ")}).`
+    );
+  }
+
+  const verifiedValidDocs = requiredDocsToInspect.filter((d) =>
+    isDocumentCurrentlyValid(d, now)
+  );
+  if (orgDocs.length > 0 && verifiedValidDocs.length === 0) {
+    blockingReasons.push(
+      "No valid, non-expired VERIFIED organization documents are present."
+    );
+  }
+
+  const requestedTypes = params.verification.requestedDocuments ?? [];
+  for (const reqType of requestedTypes) {
+    const hasVerifiedType = orgDocs.some(
+      (d) =>
+        d.documentType.toUpperCase() === reqType.toUpperCase() &&
+        isDocumentCurrentlyValid(d, now)
+    );
+    if (!hasVerifiedType) {
+      blockingReasons.push(
+        `Requested compliance document '${reqType}' has not been uploaded and verified.`
+      );
+    }
+  }
+
+  const effectiveChecklist: Record<string, boolean> = {
+    ...(params.verification.checklistState ?? {}),
+    ...(params.submittedChecklist ?? {}),
+  };
+
+  if (effectiveChecklist.licenseVerified !== true) {
+    blockingReasons.push(
+      "Mandatory checklist item 'licenseVerified' must be explicitly confirmed."
+    );
+  }
+
+  for (const [key, val] of Object.entries(effectiveChecklist)) {
+    if (val === false) {
+      blockingReasons.push(
+        `Checklist requirement '${key}' is marked incomplete (false).`
+      );
+    }
+  }
+
+  return {
+    eligible: blockingReasons.length === 0,
+    blockingReasons,
+    verifiedDocumentsCount: verifiedValidDocs.length,
+    totalOrganizationDocumentsCount: orgDocs.length,
+    effectiveChecklist,
+  };
+}
+
 export async function listAdminVerifications(filters: {
   status?: string;
   search?: string;
 }) {
-
-  const [verificationsRows, allProviders, allCenters, allDocs, allUsers] =
-    await Promise.all([
+  const [
+    verificationsRows,
+    allProviders,
+    allCenters,
+    allDocs,
+    allUsers,
+    reviewHistoryRows,
+  ] = await Promise.all([
+    db
+      .select()
+      .from(providerVerifications)
+      .orderBy(desc(providerVerifications.submittedAt)),
+    db.select().from(providers),
+    db.select().from(centers),
+    db.select().from(verificationDocuments),
+    db.select().from(users),
+    safeSelectTable(() =>
       db
         .select()
-        .from(providerVerifications)
-        .orderBy(desc(providerVerifications.submittedAt)),
-      db.select().from(providers),
-      db.select().from(centers),
-      db.select().from(verificationDocuments),
-      db.select().from(users),
-    ]);
+        .from(verificationReviewHistory)
+        .orderBy(desc(verificationReviewHistory.createdAt))
+    ),
+  ]);
 
   const providerMap = new Map(allProviders.map((p) => [p.id, p]));
   const userMap = new Map(allUsers.map((u) => [u.id, u]));
   const search = (filters.search || "").trim().toLowerCase();
+  const now = new Date();
 
   return verificationsRows
     .map((v) => {
@@ -467,6 +734,38 @@ export async function listAdminVerifications(filters: {
       );
       const provDocs = allDocs.filter((d) => d.providerId === v.providerId);
       const reviewer = v.reviewerId ? userMap.get(v.reviewerId) : null;
+
+      const eligibility = prov
+        ? evaluateProviderApprovalEligibility({
+            provider: prov,
+            verification: v,
+            providerDocuments: provDocs,
+            now,
+          })
+        : {
+            eligible: false,
+            blockingReasons: ["Associated provider record is missing."],
+            verifiedDocumentsCount: 0,
+            totalOrganizationDocumentsCount: 0,
+            effectiveChecklist: v.checklistState ?? {},
+          };
+
+      const history = reviewHistoryRows
+        .filter(
+          (h) =>
+            h.verificationId === v.id ||
+            (h.subjectType === "PROVIDER" && h.subjectId === v.providerId)
+        )
+        .map((h) => ({
+          id: h.id,
+          previousStatus: h.previousStatus,
+          newStatus: h.newStatus,
+          decision: h.decision,
+          reviewerEmail: h.reviewerEmail,
+          reviewComments: h.reviewComments,
+          rejectionReason: h.rejectionReason,
+          createdAt: h.createdAt.toISOString(),
+        }));
 
       return {
         id: v.id,
@@ -484,29 +783,51 @@ export async function listAdminVerifications(filters: {
         reviewerEmail: reviewer?.email ?? null,
         submittedAt: v.submittedAt.toISOString(),
         reviewedAt: v.reviewedAt ? v.reviewedAt.toISOString() : null,
+        expiresAt: v.expiresAt ? v.expiresAt.toISOString() : null,
         reviewComments: v.reviewComments,
         rejectionReason: v.rejectionReason,
         requestedDocuments: v.requestedDocuments ?? [],
         checklistState: v.checklistState ?? {},
+        approvalEligibility: {
+          eligible: eligibility.eligible,
+          reasons: eligibility.blockingReasons,
+          blockingReasons: eligibility.blockingReasons,
+          verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+          totalOrganizationDocumentsCount:
+            eligibility.totalOrganizationDocumentsCount,
+        },
+        history,
+        reviewHistory: history,
         centers: provCenters.map((c) => ({
           id: c.id,
           name: c.name,
           city: c.city,
           approvedCapacity: c.approvedCapacity,
           is24x7: c.is24x7,
+          verificationStatus: c.verificationStatus,
           listingStatus: c.listingStatus,
         })),
-        documents: provDocs.map((d) => ({
-          id: d.id,
-          documentType: d.documentType,
-          documentTitle: d.documentTitle,
-          mimeType: d.mimeType,
-          fileSizeBytes: d.fileSizeBytes,
-          status: d.status,
-          checksumSha256: d.checksumSha256,
-          expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
-          reviewNotes: d.reviewNotes,
-        })),
+        documents: provDocs.map((d) => {
+          const isExpired = d.expiresAt !== null && d.expiresAt <= now;
+          return {
+            id: d.id,
+            centerId: d.centerId,
+            caregiverId: d.caregiverId ?? null,
+            documentCategory: d.documentCategory ?? "PROVIDER",
+            documentType: d.documentType,
+            documentTitle: d.documentTitle,
+            mimeType: d.mimeType,
+            fileSizeBytes: d.fileSizeBytes,
+            status: isExpired && d.status !== "REJECTED" ? "EXPIRED" : d.status,
+            malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+            checksumSha256: d.checksumSha256,
+            expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
+            reviewNotes: d.reviewNotes,
+            rejectionReason: d.rejectionReason ?? null,
+            replacementRequested: d.replacementRequested ?? false,
+            accessUrl: buildPrivateDocumentAccessDescriptor(d.id),
+          };
+        }),
       };
     })
     .filter((item) => {
@@ -537,114 +858,173 @@ export async function approveProviderVerification(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [verification] = await db
-    .select()
-    .from(providerVerifications)
-    .where(eq(providerVerifications.id, params.verificationId))
-    .limit(1);
-
-  if (!verification) {
+  const trimmedComments = (params.reviewComments || "").trim();
+  if (trimmedComments.length < 3) {
     throw new AdminAuthError(
-      "VERIFICATION_NOT_FOUND",
-      "Provider verification record not found.",
-      404
-    );
-  }
-
-  const [provider] = await db
-    .select()
-    .from(providers)
-    .where(eq(providers.id, verification.providerId))
-    .limit(1);
-
-  if (!provider) {
-    throw new AdminAuthError(
-      "PROVIDER_NOT_FOUND",
-      "Associated provider not found.",
-      404
-    );
-  }
-
-  // Prevent self-approval if an admin happens to own the provider record
-  if (provider.ownerUserId === params.admin.id) {
-    throw new AdminAuthError(
-      "SELF_APPROVAL_FORBIDDEN",
-      "A provider owner cannot self-approve their own verification.",
-      403
+      "REVIEW_COMMENTS_REQUIRED",
+      "Review comments of at least 3 characters are required when approving a provider.",
+      400
     );
   }
 
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 365 * 86_400_000);
 
-  await db
-    .update(providerVerifications)
-    .set({
-      status: "APPROVED",
+  const txResult = await db.transaction(async (tx) => {
+    const [verification] = await tx
+      .select()
+      .from(providerVerifications)
+      .where(eq(providerVerifications.id, params.verificationId))
+      .limit(1);
+
+    if (!verification) {
+      throw new AdminAuthError(
+        "VERIFICATION_NOT_FOUND",
+        "Provider verification record not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, verification.providerId))
+      .limit(1);
+
+    if (!provider) {
+      throw new AdminAuthError(
+        "PROVIDER_NOT_FOUND",
+        "Associated provider not found.",
+        404
+      );
+    }
+
+    // Prevent self-approval if an admin owns the provider record
+    if (provider.ownerUserId === params.admin.id) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "A provider owner cannot self-approve their own verification.",
+        403
+      );
+    }
+
+    if (
+      verification.status !== "PENDING" &&
+      verification.status !== "UNDER_REVIEW"
+    ) {
+      throw new AdminAuthError(
+        "VERIFICATION_STATE_CONFLICT",
+        `Cannot approve provider verification from current state '${verification.status}'.`,
+        409
+      );
+    }
+
+    const providerDocs = await tx
+      .select()
+      .from(verificationDocuments)
+      .where(eq(verificationDocuments.providerId, provider.id));
+
+    const eligibility = evaluateProviderApprovalEligibility({
+      provider,
+      verification,
+      providerDocuments: providerDocs,
+      submittedChecklist: params.checklistState,
+      now,
+    });
+
+    if (!eligibility.eligible) {
+      throw new AdminAuthError(
+        "PROVIDER_APPROVAL_REQUIREMENTS_INCOMPLETE",
+        `Provider cannot be approved until all verification requirements are satisfied: ${eligibility.blockingReasons.join(" ")}`,
+        400
+      );
+    }
+
+    // Atomic conditional update to prevent concurrent contradictory decisions
+    const updatedVerifications = await tx
+      .update(providerVerifications)
+      .set({
+        status: "APPROVED",
+        reviewerId: params.admin.id,
+        reviewedAt: now,
+        reviewComments: trimmedComments,
+        rejectionReason: null,
+        requestedDocuments: [],
+        checklistState: eligibility.effectiveChecklist,
+        expiresAt,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(providerVerifications.id, verification.id),
+          eq(providerVerifications.status, verification.status)
+        )
+      )
+      .returning({ id: providerVerifications.id });
+
+    if (updatedVerifications.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent verification decision detected. Please refresh and review the current state.",
+        409
+      );
+    }
+
+    // Update ONLY the provider organization profile.
+    // Never bulk-approve associated daycare centres, caregivers, or verification documents.
+    await tx
+      .update(providers)
+      .set({
+        verificationStatus: "APPROVED",
+        isPublished: true,
+        updatedAt: now,
+      })
+      .where(eq(providers.id, provider.id));
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "PROVIDER",
+      subjectId: provider.id,
+      verificationId: verification.id,
+      previousStatus: verification.status,
+      newStatus: "APPROVED",
+      decision: "APPROVED",
       reviewerId: params.admin.id,
-      reviewedAt: now,
-      reviewComments: params.reviewComments,
-      rejectionReason: null,
-      requestedDocuments: [],
-      checklistState: params.checklistState ?? {
-        licenseVerified: true,
-        backgroundChecksVerified: true,
-        facilitySafetyVerified: true,
-        insuranceVerified: true,
+      reviewerEmail: params.admin.email,
+      reviewComments: trimmedComments,
+      evidenceSnapshot: {
+        verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+        checklistState: eligibility.effectiveChecklist,
       },
-      expiresAt,
-      updatedAt: now,
-    })
-    .where(eq(providerVerifications.id, verification.id));
+      createdAt: now,
+    });
 
-  await db
-    .update(providers)
-    .set({
-      verificationStatus: "APPROVED",
-      isPublished: true,
-      updatedAt: now,
-    })
-    .where(eq(providers.id, provider.id));
-
-  await db
-    .update(centers)
-    .set({
-      verificationStatus: "APPROVED",
-      listingStatus: "ACTIVE",
-      updatedAt: now,
-    })
-    .where(eq(centers.providerId, provider.id));
-
-  await db
-    .update(verificationDocuments)
-    .set({
-      status: "VERIFIED",
-      reviewedBy: params.admin.id,
-      reviewedAt: now,
-      reviewNotes: params.reviewComments,
-    })
-    .where(eq(verificationDocuments.providerId, provider.id));
+    return { verification, provider, eligibility };
+  });
 
   await recordAdminAuditLog({
     adminUserId: params.admin.id,
     adminEmail: params.admin.email,
     action: "PROVIDER_VERIFICATION_APPROVED",
     entityType: "PROVIDER_VERIFICATION",
-    entityId: verification.id,
-    summary: `Approved verification for ${provider.organizationName}. Comments: ${params.reviewComments}`,
+    entityId: txResult.verification.id,
+    summary: `Approved organization verification for ${txResult.provider.organizationName} (independent of centres and documents). Comments: ${trimmedComments}`,
     previousState: {
-      status: verification.status,
-      isPublished: provider.isPublished,
+      status: txResult.verification.status,
+      isPublished: txResult.provider.isPublished,
     },
-    newState: { status: "APPROVED", isPublished: true },
+    newState: {
+      status: "APPROVED",
+      isPublished: true,
+      verifiedDocumentsCount: txResult.eligibility.verifiedDocumentsCount,
+      checklistState: txResult.eligibility.effectiveChecklist,
+    },
     ipAddress: params.ipAddress,
     userAgent: params.userAgent,
   });
 
   return {
-    verificationId: verification.id,
-    providerId: provider.id,
+    verificationId: txResult.verification.id,
+    providerId: txResult.provider.id,
     status: "APPROVED" as const,
     reviewedBy: params.admin.email,
     reviewedAt: now.toISOString(),
@@ -660,68 +1040,138 @@ export async function rejectProviderVerification(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [verification] = await db
-    .select()
-    .from(providerVerifications)
-    .where(eq(providerVerifications.id, params.verificationId))
-    .limit(1);
-
-  if (!verification) {
-    throw new AdminAuthError(
-      "VERIFICATION_NOT_FOUND",
-      "Provider verification record not found.",
-      404
-    );
-  }
-
-  const [provider] = await db
-    .select()
-    .from(providers)
-    .where(eq(providers.id, verification.providerId))
-    .limit(1);
-
-  if (!provider) {
-    throw new AdminAuthError(
-      "PROVIDER_NOT_FOUND",
-      "Associated provider not found.",
-      404
-    );
-  }
-
   const now = new Date();
-  const nextStatus = params.suspendProvider ? "SUSPENDED" : "REJECTED";
+  const nextStatus: VerificationStatus = params.suspendProvider
+    ? "SUSPENDED"
+    : "REJECTED";
 
-  await db
-    .update(providerVerifications)
-    .set({
-      status: nextStatus,
+  const txResult = await db.transaction(async (tx) => {
+    const [verification] = await tx
+      .select()
+      .from(providerVerifications)
+      .where(eq(providerVerifications.id, params.verificationId))
+      .limit(1);
+
+    if (!verification) {
+      throw new AdminAuthError(
+        "VERIFICATION_NOT_FOUND",
+        "Provider verification record not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, verification.providerId))
+      .limit(1);
+
+    if (!provider) {
+      throw new AdminAuthError(
+        "PROVIDER_NOT_FOUND",
+        "Associated provider not found.",
+        404
+      );
+    }
+
+    if (provider.ownerUserId === params.admin.id) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "A provider owner cannot review their own verification.",
+        403
+      );
+    }
+
+    if (
+      !params.suspendProvider &&
+      verification.status !== "PENDING" &&
+      verification.status !== "UNDER_REVIEW"
+    ) {
+      throw new AdminAuthError(
+        "VERIFICATION_STATE_CONFLICT",
+        `Cannot reject provider verification from current state '${verification.status}'.`,
+        409
+      );
+    }
+
+    const updatedVerifications = await tx
+      .update(providerVerifications)
+      .set({
+        status: nextStatus,
+        reviewerId: params.admin.id,
+        reviewedAt: now,
+        rejectionReason: params.rejectionReason,
+        reviewComments: params.reviewComments ?? params.rejectionReason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(providerVerifications.id, verification.id),
+          eq(providerVerifications.status, verification.status)
+        )
+      )
+      .returning({ id: providerVerifications.id });
+
+    if (updatedVerifications.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent verification decision detected. Please refresh and review the current state.",
+        409
+      );
+    }
+
+    await tx
+      .update(providers)
+      .set({
+        verificationStatus: nextStatus,
+        isPublished: false,
+        updatedAt: now,
+      })
+      .where(eq(providers.id, provider.id));
+
+    // When a provider is rejected or suspended, its centres cannot remain publicly ACTIVE for new bookings,
+    // but we only demote listingStatus (and suspend if provider is suspended) without overwriting independent centre review history.
+    if (params.suspendProvider) {
+      await tx
+        .update(centers)
+        .set({
+          listingStatus: "SUSPENDED",
+          suspendedReason: `Provider suspended: ${params.rejectionReason}`,
+          updatedAt: now,
+        })
+        .where(eq(centers.providerId, provider.id));
+    } else {
+      await tx
+        .update(centers)
+        .set({
+          listingStatus: "INACTIVE",
+          suspendedReason: `Provider verification rejected: ${params.rejectionReason}`,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(centers.providerId, provider.id),
+            eq(centers.listingStatus, "ACTIVE")
+          )
+        );
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "PROVIDER",
+      subjectId: provider.id,
+      verificationId: verification.id,
+      previousStatus: verification.status,
+      newStatus: nextStatus,
+      decision: nextStatus,
       reviewerId: params.admin.id,
-      reviewedAt: now,
-      rejectionReason: params.rejectionReason,
+      reviewerEmail: params.admin.email,
       reviewComments: params.reviewComments ?? params.rejectionReason,
-      updatedAt: now,
-    })
-    .where(eq(providerVerifications.id, verification.id));
+      rejectionReason: params.rejectionReason,
+      createdAt: now,
+    });
 
-  await db
-    .update(providers)
-    .set({
-      verificationStatus: nextStatus,
-      isPublished: false,
-      updatedAt: now,
-    })
-    .where(eq(providers.id, provider.id));
-
-  await db
-    .update(centers)
-    .set({
-      verificationStatus: nextStatus,
-      listingStatus: params.suspendProvider ? "SUSPENDED" : "INACTIVE",
-      suspendedReason: params.rejectionReason,
-      updatedAt: now,
-    })
-    .where(eq(centers.providerId, provider.id));
+    return { verification, provider };
+  });
 
   await recordAdminAuditLog({
     adminUserId: params.admin.id,
@@ -730,11 +1180,11 @@ export async function rejectProviderVerification(params: {
       ? "PROVIDER_VERIFICATION_SUSPENDED"
       : "PROVIDER_VERIFICATION_REJECTED",
     entityType: "PROVIDER_VERIFICATION",
-    entityId: verification.id,
-    summary: `${nextStatus} verification for ${provider.organizationName}. Reason: ${params.rejectionReason}`,
+    entityId: txResult.verification.id,
+    summary: `${nextStatus} verification for ${txResult.provider.organizationName}. Reason: ${params.rejectionReason}`,
     previousState: {
-      status: verification.status,
-      isPublished: provider.isPublished,
+      status: txResult.verification.status,
+      isPublished: txResult.provider.isPublished,
     },
     newState: {
       status: nextStatus,
@@ -746,8 +1196,8 @@ export async function rejectProviderVerification(params: {
   });
 
   return {
-    verificationId: verification.id,
-    providerId: provider.id,
+    verificationId: txResult.verification.id,
+    providerId: txResult.provider.id,
     status: nextStatus,
     rejectionReason: params.rejectionReason,
     reviewedBy: params.admin.email,
@@ -763,66 +1213,83 @@ export async function requestProviderDocuments(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [verification] = await db
-    .select()
-    .from(providerVerifications)
-    .where(eq(providerVerifications.id, params.verificationId))
-    .limit(1);
-
-  if (!verification) {
-    throw new AdminAuthError(
-      "VERIFICATION_NOT_FOUND",
-      "Provider verification record not found.",
-      404
-    );
-  }
-
-  const [provider] = await db
-    .select()
-    .from(providers)
-    .where(eq(providers.id, verification.providerId))
-    .limit(1);
-
-  if (!provider) {
-    throw new AdminAuthError(
-      "PROVIDER_NOT_FOUND",
-      "Associated provider not found.",
-      404
-    );
-  }
-
   const now = new Date();
 
-  await db
-    .update(providerVerifications)
-    .set({
-      status: "UNDER_REVIEW",
-      reviewerId: params.admin.id,
-      reviewedAt: now,
-      requestedDocuments: params.requestedDocuments,
-      reviewComments: params.reviewComments,
-      updatedAt: now,
-    })
-    .where(eq(providerVerifications.id, verification.id));
+  const txResult = await db.transaction(async (tx) => {
+    const [verification] = await tx
+      .select()
+      .from(providerVerifications)
+      .where(eq(providerVerifications.id, params.verificationId))
+      .limit(1);
 
-  await db
-    .update(providers)
-    .set({
-      verificationStatus: "UNDER_REVIEW",
-      isPublished: false,
-      updatedAt: now,
-    })
-    .where(eq(providers.id, provider.id));
+    if (!verification) {
+      throw new AdminAuthError(
+        "VERIFICATION_NOT_FOUND",
+        "Provider verification record not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, verification.providerId))
+      .limit(1);
+
+    if (!provider) {
+      throw new AdminAuthError(
+        "PROVIDER_NOT_FOUND",
+        "Associated provider not found.",
+        404
+      );
+    }
+
+    await tx
+      .update(providerVerifications)
+      .set({
+        status: "UNDER_REVIEW",
+        reviewerId: params.admin.id,
+        reviewedAt: now,
+        requestedDocuments: params.requestedDocuments,
+        reviewComments: params.reviewComments,
+        updatedAt: now,
+      })
+      .where(eq(providerVerifications.id, verification.id));
+
+    await tx
+      .update(providers)
+      .set({
+        verificationStatus: "UNDER_REVIEW",
+        isPublished: false,
+        updatedAt: now,
+      })
+      .where(eq(providers.id, provider.id));
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "PROVIDER",
+      subjectId: provider.id,
+      verificationId: verification.id,
+      previousStatus: verification.status,
+      newStatus: "UNDER_REVIEW",
+      decision: "DOCUMENTS_REQUESTED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: params.reviewComments,
+      evidenceSnapshot: { requestedDocuments: params.requestedDocuments },
+      createdAt: now,
+    });
+
+    return { verification, provider };
+  });
 
   await recordAdminAuditLog({
     adminUserId: params.admin.id,
     adminEmail: params.admin.email,
     action: "PROVIDER_DOCUMENTS_REQUESTED",
     entityType: "PROVIDER_VERIFICATION",
-    entityId: verification.id,
-    summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) from ${provider.organizationName}`,
-    previousState: { status: verification.status },
+    entityId: txResult.verification.id,
+    summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) from ${txResult.provider.organizationName}`,
+    previousState: { status: txResult.verification.status },
     newState: {
       status: "UNDER_REVIEW",
       requestedDocuments: params.requestedDocuments,
@@ -832,8 +1299,8 @@ export async function requestProviderDocuments(params: {
   });
 
   return {
-    verificationId: verification.id,
-    providerId: provider.id,
+    verificationId: txResult.verification.id,
+    providerId: txResult.provider.id,
     status: "UNDER_REVIEW" as const,
     requestedDocuments: params.requestedDocuments,
     reviewComments: params.reviewComments,
@@ -843,8 +1310,203 @@ export async function requestProviderDocuments(params: {
 }
 
 // ==========================================
-// 3. Daycare Centre Management
+// 3. Daycare Centre Management & Independent Verification
 // ==========================================
+
+export function evaluateCenterApprovalEligibility(params: {
+  center: {
+    id: string;
+    providerId: string;
+    name: string;
+    address: string;
+    city: string;
+    state: string;
+    postalCode: string;
+    phone: string;
+    email: string;
+    approvedCapacity: number;
+    ageGroupsSupported: string[] | null;
+    operatingHours: Record<string, unknown> | null;
+    verificationStatus: string;
+    listingStatus: string;
+    verificationExpiresAt?: Date | null;
+  };
+  provider:
+    | {
+        id: string;
+        ownerUserId: string;
+        organizationName: string;
+        verificationStatus: string;
+        subscriptionActive: boolean;
+      }
+    | null
+    | undefined;
+  centerDocuments: Array<{
+    id: string;
+    centerId: string | null;
+    documentType: string;
+    documentTitle: string;
+    status: string;
+    expiresAt: Date | null;
+    malwareScanStatus?: string | null;
+  }>;
+  centerCaregivers: Array<{
+    id: string;
+    fullName: string;
+    isActive: boolean;
+    backgroundCheckStatus: string;
+    verificationExpiresAt?: Date | null;
+  }>;
+  requestedDocuments?: string[] | null;
+  submittedChecklist?: Record<string, boolean>;
+  existingChecklist?: Record<string, boolean> | null;
+  now?: Date;
+}) {
+  const now = params.now ?? new Date();
+  const blockingReasons: string[] = [];
+
+  // Rule 1: Provider must be approved and eligible
+  if (!params.provider) {
+    blockingReasons.push("Associated provider organization record not found.");
+  } else {
+    if (params.provider.verificationStatus !== "APPROVED") {
+      blockingReasons.push(
+        `Parent provider '${params.provider.organizationName}' must be APPROVED (current status: ${params.provider.verificationStatus}).`
+      );
+    }
+    if (!params.provider.subscriptionActive) {
+      blockingReasons.push(
+        `Parent provider '${params.provider.organizationName}' does not have an active operational subscription.`
+      );
+    }
+  }
+
+  // Rule 4: Required operating information must be complete
+  if (
+    !params.center.name?.trim() ||
+    !params.center.address?.trim() ||
+    !params.center.city?.trim() ||
+    !params.center.state?.trim() ||
+    !params.center.postalCode?.trim() ||
+    !params.center.phone?.trim() ||
+    !params.center.email?.trim()
+  ) {
+    blockingReasons.push(
+      "Centre physical location and contact details are incomplete."
+    );
+  }
+
+  if (!(params.center.approvedCapacity > 0)) {
+    blockingReasons.push(
+      "Declared approved capacity must be greater than zero."
+    );
+  }
+
+  const ageGroups = params.center.ageGroupsSupported ?? [];
+  if (!Array.isArray(ageGroups) || ageGroups.length === 0) {
+    blockingReasons.push("At least one supported age group must be declared.");
+  }
+
+  const opHours = params.center.operatingHours ?? {};
+  if (typeof opHours !== "object" || Object.keys(opHours).length === 0) {
+    blockingReasons.push(
+      "Declared operating hours schedule must be configured."
+    );
+  }
+
+  // Rule 3: Centre documents must be verified and current
+  if (params.centerDocuments.length === 0) {
+    blockingReasons.push(
+      "At least one facility/centre verification document must be submitted for this daycare centre."
+    );
+  } else {
+    const rejectedCenterDocs = params.centerDocuments.filter(
+      (d) => d.status === "REJECTED"
+    );
+    if (rejectedCenterDocs.length > 0) {
+      blockingReasons.push(
+        `Rejected centre document(s) must be replaced: ${rejectedCenterDocs.map((d) => d.documentTitle).join(", ")}.`
+      );
+    }
+
+    const expiredCenterDocs = params.centerDocuments.filter(
+      (d) =>
+        d.status === "EXPIRED" || (d.expiresAt !== null && d.expiresAt <= now)
+    );
+    if (expiredCenterDocs.length > 0) {
+      blockingReasons.push(
+        `Expired centre document(s) must be renewed: ${expiredCenterDocs.map((d) => d.documentTitle).join(", ")}.`
+      );
+    }
+
+    const unverifiedCenterDocs = params.centerDocuments.filter(
+      (d) =>
+        d.status !== "VERIFIED" &&
+        d.status !== "REJECTED" &&
+        d.status !== "EXPIRED"
+    );
+    if (unverifiedCenterDocs.length > 0) {
+      blockingReasons.push(
+        `All submitted centre documents must be individually VERIFIED (${unverifiedCenterDocs.length} unverified).`
+      );
+    }
+  }
+
+  const verifiedCenterDocs = params.centerDocuments.filter((d) =>
+    isDocumentCurrentlyValid(d, now)
+  );
+  if (params.centerDocuments.length > 0 && verifiedCenterDocs.length === 0) {
+    blockingReasons.push(
+      "No valid, non-expired VERIFIED centre documents are available."
+    );
+  }
+
+  for (const reqDoc of params.requestedDocuments ?? []) {
+    const satisfied = params.centerDocuments.some(
+      (d) =>
+        d.documentType.toUpperCase() === reqDoc.toUpperCase() &&
+        isDocumentCurrentlyValid(d, now)
+    );
+    if (!satisfied) {
+      blockingReasons.push(
+        `Requested centre document '${reqDoc}' has not been uploaded and verified.`
+      );
+    }
+  }
+
+  // Rule 5: Applicable caregiver and staffing requirements must be satisfied
+  const eligibleCaregivers = params.centerCaregivers.filter((cg) =>
+    isCaregiverEligibleForStaffing(cg, now)
+  );
+  if (eligibleCaregivers.length === 0) {
+    blockingReasons.push(
+      "At least one active, non-expired VERIFIED caregiver must be assigned to this centre."
+    );
+  }
+
+  const effectiveChecklist: Record<string, boolean> = {
+    ...(params.existingChecklist ?? {}),
+    ...(params.submittedChecklist ?? {}),
+  };
+
+  for (const [key, val] of Object.entries(effectiveChecklist)) {
+    if (val === false) {
+      blockingReasons.push(
+        `Centre checklist item '${key}' is marked incomplete (false).`
+      );
+    }
+  }
+
+  return {
+    eligible: blockingReasons.length === 0,
+    blockingReasons,
+    verifiedDocumentsCount: verifiedCenterDocs.length,
+    totalCenterDocumentsCount: params.centerDocuments.length,
+    eligibleCaregiversCount: eligibleCaregivers.length,
+    totalCaregiversCount: params.centerCaregivers.length,
+    effectiveChecklist,
+  };
+}
 
 export async function listAdminCenters(filters: {
   search?: string;
@@ -852,17 +1514,18 @@ export async function listAdminCenters(filters: {
   verificationStatus?: string;
   city?: string;
 }) {
-
-  const [allCenters, allProviders, allCaregivers, allIncidents] =
+  const [allCenters, allProviders, allCaregivers, allIncidents, allDocs] =
     await Promise.all([
       db.select().from(centers).orderBy(desc(centers.createdAt)),
       db.select().from(providers),
       db.select().from(caregivers),
       db.select().from(safetyIncidents),
+      db.select().from(verificationDocuments),
     ]);
 
   const providerMap = new Map(allProviders.map((p) => [p.id, p]));
   const search = (filters.search || "").trim().toLowerCase();
+  const now = new Date();
 
   return allCenters
     .filter((c) => {
@@ -902,14 +1565,24 @@ export async function listAdminCenters(filters: {
       const centerCaregivers = allCaregivers.filter(
         (cg) => cg.centerId === c.id
       );
+      const centerDocs = allDocs.filter((d) => d.centerId === c.id);
       const centerIncidents = allIncidents.filter(
         (inc) => inc.centerId === c.id
       );
+
+      const eligibility = evaluateCenterApprovalEligibility({
+        center: c,
+        provider: prov,
+        centerDocuments: centerDocs,
+        centerCaregivers,
+        now,
+      });
 
       return {
         id: c.id,
         providerId: c.providerId,
         providerName: prov?.organizationName ?? "Unknown Provider",
+        providerVerificationStatus: prov?.verificationStatus ?? "PENDING",
         name: c.name,
         slug: c.slug,
         description: c.description,
@@ -929,8 +1602,17 @@ export async function listAdminCenters(filters: {
         verificationStatus: c.verificationStatus,
         listingStatus: c.listingStatus,
         suspendedReason: c.suspendedReason,
-        rating: c.rating,
-        caregiversCount: centerCaregivers.length,
+        reviewComments: c.reviewComments ?? null,
+        rejectionReason: c.rejectionReason ?? null,
+        rating: c.rating ?? null,
+        caregiversCount: eligibility.eligibleCaregiversCount,
+        totalCaregiversCount: centerCaregivers.length,
+        verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+        totalDocumentsCount: centerDocs.length,
+        approvalEligibility: {
+          eligible: eligibility.eligible,
+          blockingReasons: eligibility.blockingReasons,
+        },
         openIncidentsCount: centerIncidents.filter(
           (i) => i.status !== "RESOLVED" && i.status !== "CLOSED"
         ).length,
@@ -940,7 +1622,6 @@ export async function listAdminCenters(filters: {
 }
 
 export async function getAdminCenterById(centerId: string) {
-
   const [center] = await db
     .select()
     .from(centers)
@@ -955,36 +1636,87 @@ export async function getAdminCenterById(centerId: string) {
     );
   }
 
-  const [providerRows, centerCaregivers, rules, centerIncidents, centerBookings] =
-    await Promise.all([
+  const [
+    providerRows,
+    centerCaregivers,
+    rules,
+    centerIncidents,
+    centerBookings,
+    centerDocs,
+    reviewHistoryRows,
+  ] = await Promise.all([
+    db
+      .select()
+      .from(providers)
+      .where(eq(providers.id, center.providerId))
+      .limit(1),
+    db.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
+    db
+      .select()
+      .from(capacityRules)
+      .where(eq(capacityRules.centerId, center.id)),
+    db
+      .select()
+      .from(safetyIncidents)
+      .where(eq(safetyIncidents.centerId, center.id))
+      .orderBy(desc(safetyIncidents.occurredAt)),
+    db
+      .select()
+      .from(bookings)
+      .where(eq(bookings.centerId, center.id))
+      .orderBy(desc(bookings.startTime)),
+    db
+      .select()
+      .from(verificationDocuments)
+      .where(eq(verificationDocuments.centerId, center.id)),
+    safeSelectTable(() =>
       db
         .select()
-        .from(providers)
-        .where(eq(providers.id, center.providerId))
-        .limit(1),
-      db.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
-      db
-        .select()
-        .from(capacityRules)
-        .where(eq(capacityRules.centerId, center.id)),
-      db
-        .select()
-        .from(safetyIncidents)
-        .where(eq(safetyIncidents.centerId, center.id))
-        .orderBy(desc(safetyIncidents.occurredAt)),
-      db
-        .select()
-        .from(bookings)
-        .where(eq(bookings.centerId, center.id))
-        .orderBy(desc(bookings.startTime)),
-    ]);
+        .from(verificationReviewHistory)
+        .orderBy(desc(verificationReviewHistory.createdAt))
+    ),
+  ]);
 
   const provider = providerRows[0] ?? null;
+  const now = new Date();
+  const eligibility = evaluateCenterApprovalEligibility({
+    center,
+    provider,
+    centerDocuments: centerDocs,
+    centerCaregivers,
+    now,
+  });
+
+  const history = reviewHistoryRows
+    .filter((h) => h.subjectType === "CENTER" && h.subjectId === center.id)
+    .map((h) => ({
+      id: h.id,
+      previousStatus: h.previousStatus,
+      newStatus: h.newStatus,
+      decision: h.decision,
+      reviewerEmail: h.reviewerEmail,
+      reviewComments: h.reviewComments,
+      rejectionReason: h.rejectionReason,
+      createdAt: h.createdAt.toISOString(),
+    }));
 
   return {
     ...center,
+    rating: center.rating ?? null,
     createdAt: center.createdAt.toISOString(),
     updatedAt: center.updatedAt.toISOString(),
+    verifiedAt: center.verifiedAt ? center.verifiedAt.toISOString() : null,
+    verificationExpiresAt: center.verificationExpiresAt
+      ? center.verificationExpiresAt.toISOString()
+      : null,
+    approvalEligibility: {
+      eligible: eligibility.eligible,
+      reasons: eligibility.blockingReasons,
+      blockingReasons: eligibility.blockingReasons,
+      verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+      eligibleCaregiversCount: eligibility.eligibleCaregiversCount,
+    },
+    history,
     provider: provider
       ? {
           id: provider.id,
@@ -993,6 +1725,22 @@ export async function getAdminCenterById(centerId: string) {
           verificationStatus: provider.verificationStatus,
         }
       : null,
+    documents: centerDocs.map((d) => ({
+      id: d.id,
+      documentType: d.documentType,
+      documentTitle: d.documentTitle,
+      mimeType: d.mimeType,
+      fileSizeBytes: d.fileSizeBytes,
+      status:
+        d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
+          ? "EXPIRED"
+          : d.status,
+      malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+      expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
+      reviewNotes: d.reviewNotes,
+      rejectionReason: d.rejectionReason ?? null,
+      accessUrl: buildPrivateDocumentAccessDescriptor(d.id),
+    })),
     caregivers: centerCaregivers.map((cg) => ({
       id: cg.id,
       fullName: cg.fullName,
@@ -1000,9 +1748,16 @@ export async function getAdminCenterById(centerId: string) {
       phone: cg.phone,
       roleTitle: cg.roleTitle,
       certifications: cg.certifications,
-      backgroundCheckStatus: cg.backgroundCheckStatus,
+      backgroundCheckStatus: getEffectiveCaregiverStatus(cg, now),
       yearsExperience: cg.yearsExperience,
       isActive: cg.isActive,
+      eligibleForStaffing: isCaregiverEligibleForStaffing(cg, now),
+      verifiedAt: cg.verifiedAt ? cg.verifiedAt.toISOString() : null,
+      verificationExpiresAt: cg.verificationExpiresAt
+        ? cg.verificationExpiresAt.toISOString()
+        : null,
+      reviewComments: cg.reviewComments ?? null,
+      rejectionReason: cg.rejectionReason ?? null,
     })),
     capacityRules: rules.map((r) => ({
       id: r.id,
@@ -1034,7 +1789,6 @@ export async function updateAdminCenterStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
   const [center] = await db
     .select()
     .from(centers)
@@ -1049,15 +1803,56 @@ export async function updateAdminCenterStatus(params: {
     );
   }
 
-  if (
-    params.listingStatus === "ACTIVE" &&
-    center.verificationStatus !== "APPROVED"
-  ) {
-    throw new AdminAuthError(
-      "CENTER_UNVERIFIED",
-      "Cannot publicly activate a centre listing until its provider verification status is APPROVED.",
-      400
-    );
+  const now = new Date();
+
+  if (params.listingStatus === "ACTIVE") {
+    if (center.verificationStatus !== "APPROVED") {
+      throw new AdminAuthError(
+        "CENTER_UNVERIFIED",
+        "Cannot publicly activate a centre listing until its independent centre verification status is APPROVED.",
+        400
+      );
+    }
+
+    if (
+      center.verificationExpiresAt &&
+      center.verificationExpiresAt <= now
+    ) {
+      throw new AdminAuthError(
+        "CENTER_VERIFICATION_EXPIRED",
+        "Cannot activate centre listing: centre verification has expired.",
+        400
+      );
+    }
+
+    const [providerRows, centerDocs, centerCaregivers] = await Promise.all([
+      db
+        .select()
+        .from(providers)
+        .where(eq(providers.id, center.providerId))
+        .limit(1),
+      db
+        .select()
+        .from(verificationDocuments)
+        .where(eq(verificationDocuments.centerId, center.id)),
+      db.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
+    ]);
+
+    const eligibility = evaluateCenterApprovalEligibility({
+      center,
+      provider: providerRows[0],
+      centerDocuments: centerDocs,
+      centerCaregivers,
+      now,
+    });
+
+    if (!eligibility.eligible) {
+      throw new AdminAuthError(
+        "CENTER_ACTIVATION_ELIGIBILITY_FAILED",
+        `Cannot activate centre listing: ${eligibility.blockingReasons.join(" ")}`,
+        400
+      );
+    }
   }
 
   // Check active bookings so administrative actions never silently corrupt existing bookings
@@ -1070,7 +1865,6 @@ export async function updateAdminCenterStatus(params: {
     ["CONFIRMED", "CHECKED_IN"].includes(b.status)
   );
 
-  const now = new Date();
   const [updated] = await db
     .update(centers)
     .set({
@@ -1106,6 +1900,1769 @@ export async function updateAdminCenterStatus(params: {
     suspendedReason: updated.suspendedReason,
     preservedActiveBookingsCount: activeBookings.length,
     updatedAt: updated.updatedAt.toISOString(),
+  };
+}
+
+export async function listAdminCenterVerifications(filters: {
+  status?: string;
+  search?: string;
+}) {
+  const [
+    allCenters,
+    allProviders,
+    allDocs,
+    allCaregivers,
+    centerVerifRows,
+    historyRows,
+  ] = await Promise.all([
+    db.select().from(centers).orderBy(desc(centers.createdAt)),
+    db.select().from(providers),
+    db.select().from(verificationDocuments),
+    db.select().from(caregivers),
+    safeSelectTable(() =>
+      db
+        .select()
+        .from(centerVerifications)
+        .orderBy(desc(centerVerifications.submittedAt))
+    ),
+    safeSelectTable(() =>
+      db
+        .select()
+        .from(verificationReviewHistory)
+        .orderBy(desc(verificationReviewHistory.createdAt))
+    ),
+  ]);
+
+  const providerMap = new Map(allProviders.map((p) => [p.id, p]));
+  const search = (filters.search || "").trim().toLowerCase();
+  const now = new Date();
+
+  return allCenters
+    .map((c) => {
+      const prov = providerMap.get(c.providerId);
+      const centerDocs = allDocs.filter((d) => d.centerId === c.id);
+      const centerCaregivers = allCaregivers.filter(
+        (cg) => cg.centerId === c.id
+      );
+      const verifRecord = centerVerifRows.find((cv) => cv.centerId === c.id);
+
+      const effectiveStatus: VerificationStatus =
+        c.verificationStatus === "APPROVED" &&
+        c.verificationExpiresAt &&
+        c.verificationExpiresAt <= now
+          ? "EXPIRED"
+          : (verifRecord?.status ?? c.verificationStatus);
+
+      const eligibility = evaluateCenterApprovalEligibility({
+        center: c,
+        provider: prov,
+        centerDocuments: centerDocs,
+        centerCaregivers,
+        requestedDocuments: verifRecord?.requestedDocuments ?? [],
+        existingChecklist: verifRecord?.checklistState ?? {},
+        now,
+      });
+
+      const history = historyRows
+        .filter((h) => h.subjectType === "CENTER" && h.subjectId === c.id)
+        .map((h) => ({
+          id: h.id,
+          previousStatus: h.previousStatus,
+          newStatus: h.newStatus,
+          decision: h.decision,
+          reviewerEmail: h.reviewerEmail,
+          reviewComments: h.reviewComments,
+          rejectionReason: h.rejectionReason,
+          createdAt: h.createdAt.toISOString(),
+        }));
+
+      return {
+        id: verifRecord?.id ?? c.id,
+        centerId: c.id,
+        providerId: c.providerId,
+        providerName: prov?.organizationName ?? "Unknown Provider",
+        providerVerificationStatus: prov?.verificationStatus ?? "PENDING",
+        centerName: c.name,
+        city: c.city,
+        state: c.state,
+        address: c.address,
+        approvedCapacity: c.approvedCapacity,
+        is24x7: c.is24x7,
+        ageGroupsSupported: c.ageGroupsSupported,
+        status: effectiveStatus,
+        verificationStatus: effectiveStatus as VerificationStatus,
+        listingStatus: c.listingStatus,
+        reviewComments:
+          verifRecord?.reviewComments ?? c.reviewComments ?? null,
+        rejectionReason:
+          verifRecord?.rejectionReason ?? c.rejectionReason ?? null,
+        requestedDocuments: verifRecord?.requestedDocuments ?? [],
+        checklistState: verifRecord?.checklistState ?? {},
+        verifiedAt: c.verifiedAt ? c.verifiedAt.toISOString() : null,
+        expiresAt: c.verificationExpiresAt
+          ? c.verificationExpiresAt.toISOString()
+          : verifRecord?.expiresAt
+            ? verifRecord.expiresAt.toISOString()
+            : null,
+        approvalEligibility: {
+          eligible: eligibility.eligible,
+          reasons: eligibility.blockingReasons,
+          blockingReasons: eligibility.blockingReasons,
+          verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+          totalCenterDocumentsCount: eligibility.totalCenterDocumentsCount,
+          eligibleCaregiversCount: eligibility.eligibleCaregiversCount,
+          totalCaregiversCount: eligibility.totalCaregiversCount,
+        },
+        caregivers: centerCaregivers.map((cg) => ({
+          id: cg.id,
+          fullName: cg.fullName,
+          email: cg.email,
+          roleTitle: cg.roleTitle,
+          backgroundCheckStatus: getEffectiveCaregiverStatus(cg, now),
+          isExpired:
+            cg.verificationExpiresAt !== null &&
+            cg.verificationExpiresAt <= now,
+          isActive: cg.isActive,
+          verifiedAt: cg.verifiedAt ? cg.verifiedAt.toISOString() : null,
+          verificationExpiresAt: cg.verificationExpiresAt
+            ? cg.verificationExpiresAt.toISOString()
+            : null,
+        })),
+        documents: centerDocs.map((d) => ({
+          id: d.id,
+          documentType: d.documentType,
+          documentTitle: d.documentTitle,
+          status:
+            d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
+              ? "EXPIRED"
+              : d.status,
+          expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
+        })),
+        history,
+        reviewHistory: history,
+      };
+    })
+    .filter((item) => {
+      if (
+        filters.status &&
+        filters.status !== "ALL" &&
+        item.status !== filters.status
+      ) {
+        return false;
+      }
+      if (
+        search &&
+        !item.centerName.toLowerCase().includes(search) &&
+        !item.providerName.toLowerCase().includes(search) &&
+        !item.city.toLowerCase().includes(search)
+      ) {
+        return false;
+      }
+      return true;
+    });
+}
+
+export async function getAdminCenterVerificationById(idOrCenterId: string) {
+  const items = await listAdminCenterVerifications({});
+  const match = items.find(
+    (item) => item.id === idOrCenterId || item.centerId === idOrCenterId
+  );
+  if (!match) {
+    throw new AdminAuthError(
+      "CENTER_VERIFICATION_NOT_FOUND",
+      "Daycare centre verification record not found.",
+      404
+    );
+  }
+  return match;
+}
+
+export async function approveCenterVerification(params: {
+  idOrCenterId: string;
+  reviewComments: string;
+  checklistState?: Record<string, boolean>;
+  safetyComplianceNotes?: string;
+  activateListing?: boolean;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const trimmedComments = (params.reviewComments || "").trim();
+  if (trimmedComments.length < 3) {
+    throw new AdminAuthError(
+      "REVIEW_COMMENTS_REQUIRED",
+      "Review comments of at least 3 characters are required when approving a daycare centre.",
+      400
+    );
+  }
+
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + 365 * 86_400_000);
+  const targetListingStatus: CenterListingStatus =
+    params.activateListing === false ? "INACTIVE" : "ACTIVE";
+
+  const txResult = await db.transaction(async (tx) => {
+    const existingVerifs = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(centerVerifications)
+        .where(eq(centerVerifications.id, params.idOrCenterId))
+    );
+    const resolvedCenterId =
+      existingVerifs[0]?.centerId ?? params.idOrCenterId;
+
+    const [center] = await tx
+      .select()
+      .from(centers)
+      .where(eq(centers.id, resolvedCenterId))
+      .limit(1);
+
+    if (!center) {
+      throw new AdminAuthError(
+        "CENTER_NOT_FOUND",
+        "Daycare centre not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, center.providerId))
+      .limit(1);
+
+    if (!provider) {
+      throw new AdminAuthError(
+        "PROVIDER_NOT_FOUND",
+        "Parent provider organization not found.",
+        404
+      );
+    }
+
+    if (provider.ownerUserId === params.admin.id) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "A provider owner cannot self-approve their own daycare centre.",
+        403
+      );
+    }
+
+    if (center.verificationStatus === "APPROVED" && center.listingStatus === "ACTIVE") {
+      throw new AdminAuthError(
+        "CENTER_ALREADY_APPROVED",
+        "This daycare centre is already verified and active.",
+        409
+      );
+    }
+
+    if (
+      center.listingStatus === "SUSPENDED" ||
+      center.verificationStatus === "SUSPENDED"
+    ) {
+      throw new AdminAuthError(
+        "CENTER_SUSPENDED",
+        "Suspended daycare centres cannot be approved or activated while under compliance hold.",
+        400
+      );
+    }
+
+    const [centerDocs, centerCaregivers, centerVerifByCenter] =
+      await Promise.all([
+        tx
+          .select()
+          .from(verificationDocuments)
+          .where(eq(verificationDocuments.centerId, center.id)),
+        tx.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
+        safeSelectTable(() =>
+          tx
+            .select()
+            .from(centerVerifications)
+            .where(eq(centerVerifications.centerId, center.id))
+        ),
+      ]);
+
+    const verifRecord = existingVerifs[0] ?? centerVerifByCenter[0] ?? null;
+
+    const eligibility = evaluateCenterApprovalEligibility({
+      center,
+      provider,
+      centerDocuments: centerDocs,
+      centerCaregivers,
+      requestedDocuments: verifRecord?.requestedDocuments ?? [],
+      existingChecklist: verifRecord?.checklistState ?? {},
+      submittedChecklist: params.checklistState,
+      now,
+    });
+
+    if (!eligibility.eligible) {
+      throw new AdminAuthError(
+        "CENTER_APPROVAL_REQUIREMENTS_INCOMPLETE",
+        `Daycare centre cannot be approved: ${eligibility.blockingReasons.join(" ")}`,
+        400
+      );
+    }
+
+    // Conditional update on centers to prevent concurrent conflicting decisions
+    const updatedCenters = await tx
+      .update(centers)
+      .set({
+        verificationStatus: "APPROVED",
+        listingStatus: targetListingStatus,
+        verifiedBy: params.admin.id,
+        verifiedAt: now,
+        verificationExpiresAt: expiresAt,
+        reviewComments: trimmedComments,
+        rejectionReason: null,
+        suspendedReason: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(centers.id, center.id),
+          eq(centers.verificationStatus, center.verificationStatus)
+        )
+      )
+      .returning();
+
+    if (updatedCenters.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent centre verification decision detected.",
+        409
+      );
+    }
+
+    let verifId = verifRecord?.id ?? center.id;
+    if (verifRecord) {
+      await tx
+        .update(centerVerifications)
+        .set({
+          status: "APPROVED",
+          reviewerId: params.admin.id,
+          reviewedAt: now,
+          reviewComments: trimmedComments,
+          rejectionReason: null,
+          requestedDocuments: [],
+          checklistState: eligibility.effectiveChecklist,
+          safetyComplianceNotes: params.safetyComplianceNotes ?? null,
+          expiresAt,
+          updatedAt: now,
+        })
+        .where(eq(centerVerifications.id, verifRecord.id));
+    } else {
+      const [insertedVerif] = await tx
+        .insert(centerVerifications)
+        .values({
+          centerId: center.id,
+          providerId: provider.id,
+          status: "APPROVED",
+          reviewerId: params.admin.id,
+          submittedAt: center.createdAt,
+          reviewedAt: now,
+          reviewComments: trimmedComments,
+          checklistState: eligibility.effectiveChecklist,
+          safetyComplianceNotes: params.safetyComplianceNotes ?? null,
+          expiresAt,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({ id: centerVerifications.id });
+      if (insertedVerif) {
+        verifId = insertedVerif.id;
+      }
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "CENTER",
+      subjectId: center.id,
+      verificationId: verifId,
+      previousStatus: center.verificationStatus,
+      newStatus: "APPROVED",
+      decision: "APPROVED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: trimmedComments,
+      evidenceSnapshot: {
+        verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+        eligibleCaregiversCount: eligibility.eligibleCaregiversCount,
+        listingStatus: targetListingStatus,
+      },
+      createdAt: now,
+    });
+
+    return { center, provider, verifId, eligibility };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: "CENTER_VERIFICATION_APPROVED",
+    entityType: "CENTER_VERIFICATION",
+    entityId: txResult.center.id,
+    summary: `Approved daycare centre "${txResult.center.name}" (${txResult.provider.organizationName}) and set listingStatus to ${targetListingStatus}. Comments: ${trimmedComments}`,
+    previousState: {
+      verificationStatus: txResult.center.verificationStatus,
+      listingStatus: txResult.center.listingStatus,
+    },
+    newState: {
+      verificationStatus: "APPROVED",
+      listingStatus: targetListingStatus,
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    verificationId: txResult.verifId,
+    centerId: txResult.center.id,
+    status: "APPROVED" as const,
+    listingStatus: targetListingStatus,
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+export async function rejectCenterVerification(params: {
+  idOrCenterId: string;
+  rejectionReason: string;
+  reviewComments?: string;
+  suspendCenter?: boolean;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const now = new Date();
+  const nextStatus: VerificationStatus = params.suspendCenter
+    ? "SUSPENDED"
+    : "REJECTED";
+  const nextListingStatus: CenterListingStatus = params.suspendCenter
+    ? "SUSPENDED"
+    : "INACTIVE";
+
+  const txResult = await db.transaction(async (tx) => {
+    const existingVerifs = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(centerVerifications)
+        .where(eq(centerVerifications.id, params.idOrCenterId))
+    );
+    const resolvedCenterId =
+      existingVerifs[0]?.centerId ?? params.idOrCenterId;
+
+    const [center] = await tx
+      .select()
+      .from(centers)
+      .where(eq(centers.id, resolvedCenterId))
+      .limit(1);
+
+    if (!center) {
+      throw new AdminAuthError(
+        "CENTER_NOT_FOUND",
+        "Daycare centre not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, center.providerId))
+      .limit(1);
+
+    if (provider && provider.ownerUserId === params.admin.id) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "A provider owner cannot review their own daycare centre.",
+        403
+      );
+    }
+
+    const updatedCenters = await tx
+      .update(centers)
+      .set({
+        verificationStatus: nextStatus,
+        listingStatus: nextListingStatus,
+        verifiedBy: params.admin.id,
+        verifiedAt: now,
+        rejectionReason: params.rejectionReason,
+        reviewComments: params.reviewComments ?? params.rejectionReason,
+        suspendedReason: params.rejectionReason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(centers.id, center.id),
+          eq(centers.verificationStatus, center.verificationStatus)
+        )
+      )
+      .returning();
+
+    if (updatedCenters.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent centre verification decision detected.",
+        409
+      );
+    }
+
+    const byCenter = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(centerVerifications)
+        .where(eq(centerVerifications.centerId, center.id))
+    );
+    const verifRecord = existingVerifs[0] ?? byCenter[0] ?? null;
+    let verifId = verifRecord?.id ?? center.id;
+
+    if (verifRecord) {
+      await tx
+        .update(centerVerifications)
+        .set({
+          status: nextStatus,
+          reviewerId: params.admin.id,
+          reviewedAt: now,
+          rejectionReason: params.rejectionReason,
+          reviewComments: params.reviewComments ?? params.rejectionReason,
+          updatedAt: now,
+        })
+        .where(eq(centerVerifications.id, verifRecord.id));
+    } else {
+      const [inserted] = await tx
+        .insert(centerVerifications)
+        .values({
+          centerId: center.id,
+          providerId: center.providerId,
+          status: nextStatus,
+          reviewerId: params.admin.id,
+          submittedAt: center.createdAt,
+          reviewedAt: now,
+          rejectionReason: params.rejectionReason,
+          reviewComments: params.reviewComments ?? params.rejectionReason,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({ id: centerVerifications.id });
+      if (inserted) verifId = inserted.id;
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "CENTER",
+      subjectId: center.id,
+      verificationId: verifId,
+      previousStatus: center.verificationStatus,
+      newStatus: nextStatus,
+      decision: nextStatus,
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: params.reviewComments ?? params.rejectionReason,
+      rejectionReason: params.rejectionReason,
+      createdAt: now,
+    });
+
+    return { center, verifId };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: params.suspendCenter
+      ? "CENTER_VERIFICATION_SUSPENDED"
+      : "CENTER_VERIFICATION_REJECTED",
+    entityType: "CENTER_VERIFICATION",
+    entityId: txResult.center.id,
+    summary: `${nextStatus} daycare centre "${txResult.center.name}". Reason: ${params.rejectionReason}`,
+    previousState: {
+      verificationStatus: txResult.center.verificationStatus,
+      listingStatus: txResult.center.listingStatus,
+    },
+    newState: {
+      verificationStatus: nextStatus,
+      listingStatus: nextListingStatus,
+      rejectionReason: params.rejectionReason,
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    verificationId: txResult.verifId,
+    centerId: txResult.center.id,
+    status: nextStatus,
+    listingStatus: nextListingStatus,
+    rejectionReason: params.rejectionReason,
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+export async function requestCenterDocuments(params: {
+  idOrCenterId: string;
+  requestedDocuments: string[];
+  reviewComments: string;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const now = new Date();
+
+  const txResult = await db.transaction(async (tx) => {
+    const existingVerifs = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(centerVerifications)
+        .where(eq(centerVerifications.id, params.idOrCenterId))
+    );
+    const resolvedCenterId =
+      existingVerifs[0]?.centerId ?? params.idOrCenterId;
+
+    const [center] = await tx
+      .select()
+      .from(centers)
+      .where(eq(centers.id, resolvedCenterId))
+      .limit(1);
+
+    if (!center) {
+      throw new AdminAuthError(
+        "CENTER_NOT_FOUND",
+        "Daycare centre not found.",
+        404
+      );
+    }
+
+    await tx
+      .update(centers)
+      .set({
+        verificationStatus: "UNDER_REVIEW",
+        listingStatus:
+          center.listingStatus === "ACTIVE"
+            ? "PENDING_APPROVAL"
+            : center.listingStatus,
+        reviewComments: params.reviewComments,
+        updatedAt: now,
+      })
+      .where(eq(centers.id, center.id));
+
+    const byCenter = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(centerVerifications)
+        .where(eq(centerVerifications.centerId, center.id))
+    );
+    const verifRecord = existingVerifs[0] ?? byCenter[0] ?? null;
+    let verifId = verifRecord?.id ?? center.id;
+
+    if (verifRecord) {
+      await tx
+        .update(centerVerifications)
+        .set({
+          status: "UNDER_REVIEW",
+          reviewerId: params.admin.id,
+          reviewedAt: now,
+          requestedDocuments: params.requestedDocuments,
+          reviewComments: params.reviewComments,
+          updatedAt: now,
+        })
+        .where(eq(centerVerifications.id, verifRecord.id));
+    } else {
+      const [inserted] = await tx
+        .insert(centerVerifications)
+        .values({
+          centerId: center.id,
+          providerId: center.providerId,
+          status: "UNDER_REVIEW",
+          reviewerId: params.admin.id,
+          submittedAt: center.createdAt,
+          reviewedAt: now,
+          requestedDocuments: params.requestedDocuments,
+          reviewComments: params.reviewComments,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({ id: centerVerifications.id });
+      if (inserted) verifId = inserted.id;
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "CENTER",
+      subjectId: center.id,
+      verificationId: verifId,
+      previousStatus: center.verificationStatus,
+      newStatus: "UNDER_REVIEW",
+      decision: "DOCUMENTS_REQUESTED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: params.reviewComments,
+      evidenceSnapshot: { requestedDocuments: params.requestedDocuments },
+      createdAt: now,
+    });
+
+    return { center, verifId };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: "CENTER_DOCUMENTS_REQUESTED",
+    entityType: "CENTER_VERIFICATION",
+    entityId: txResult.center.id,
+    summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) for centre "${txResult.center.name}"`,
+    previousState: { verificationStatus: txResult.center.verificationStatus },
+    newState: {
+      verificationStatus: "UNDER_REVIEW",
+      requestedDocuments: params.requestedDocuments,
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    verificationId: txResult.verifId,
+    centerId: txResult.center.id,
+    status: "UNDER_REVIEW" as const,
+    requestedDocuments: params.requestedDocuments,
+    reviewComments: params.reviewComments,
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+// ==========================================
+// 3B. Caregiver Verification & Document Review
+// ==========================================
+
+export async function listAdminCaregiverVerifications(filters: {
+  status?: string;
+  centerId?: string;
+  search?: string;
+}) {
+  const [
+    allCaregivers,
+    allCenters,
+    allProviders,
+    allDocs,
+    allUsers,
+    cgVerifRows,
+    historyRows,
+  ] = await Promise.all([
+    db.select().from(caregivers).orderBy(desc(caregivers.createdAt)),
+    db.select().from(centers),
+    db.select().from(providers),
+    db.select().from(verificationDocuments),
+    db.select().from(users),
+    safeSelectTable(() =>
+      db
+        .select()
+        .from(caregiverVerifications)
+        .orderBy(desc(caregiverVerifications.submittedAt))
+    ),
+    safeSelectTable(() =>
+      db
+        .select()
+        .from(verificationReviewHistory)
+        .orderBy(desc(verificationReviewHistory.createdAt))
+    ),
+  ]);
+
+  const centerMap = new Map(allCenters.map((c) => [c.id, c]));
+  const providerMap = new Map(allProviders.map((p) => [p.id, p]));
+  const userMap = new Map(allUsers.map((u) => [u.id, u]));
+  const search = (filters.search || "").trim().toLowerCase();
+  const now = new Date();
+
+  return allCaregivers
+    .map((cg) => {
+      const center = centerMap.get(cg.centerId);
+      const prov = center ? providerMap.get(center.providerId) : undefined;
+      const verifRecord = cgVerifRows.find((v) => v.caregiverId === cg.id);
+      const cgDocs = allDocs.filter(
+        (d) =>
+          d.caregiverId === cg.id ||
+          (verifRecord?.documentReferences ?? []).includes(d.id)
+      );
+      const effectiveStatus = getEffectiveCaregiverStatus(cg, now);
+      const validDocs = cgDocs.filter((d) => isDocumentCurrentlyValid(d, now));
+      const reviewer = cg.verifiedBy ? userMap.get(cg.verifiedBy) : null;
+
+      const blockingReasons: string[] = [];
+      if (!cg.isActive || effectiveStatus === "SUSPENDED") {
+        blockingReasons.push("Caregiver is currently inactive or suspended.");
+      }
+      if (cgDocs.length === 0) {
+        blockingReasons.push(
+          "At least one caregiver background screening or credential document must be submitted."
+        );
+      } else if (validDocs.length === 0) {
+        blockingReasons.push(
+          "Supporting caregiver screening document(s) must be individually VERIFIED and non-expired."
+        );
+      }
+
+      const history = historyRows
+        .filter((h) => h.subjectType === "CAREGIVER" && h.subjectId === cg.id)
+        .map((h) => ({
+          id: h.id,
+          previousStatus: h.previousStatus,
+          newStatus: h.newStatus,
+          decision: h.decision,
+          reviewerEmail: h.reviewerEmail,
+          reviewComments: h.reviewComments,
+          rejectionReason: h.rejectionReason,
+          createdAt: h.createdAt.toISOString(),
+        }));
+
+      return {
+        id: verifRecord?.id ?? cg.id,
+        caregiverId: cg.id,
+        centerId: cg.centerId,
+        centerName: center?.name ?? "Unknown Centre",
+        providerId: prov?.id ?? "",
+        providerName: prov?.organizationName ?? "Unknown Provider",
+        fullName: cg.fullName,
+        email: cg.email,
+        phone: cg.phone,
+        roleTitle: cg.roleTitle,
+        certifications: cg.certifications,
+        yearsExperience: cg.yearsExperience,
+        isActive: cg.isActive,
+        status: effectiveStatus,
+        backgroundCheckStatus: effectiveStatus,
+        rawBackgroundCheckStatus: cg.backgroundCheckStatus as CaregiverVerificationStatus,
+        isExpired:
+          cg.verificationExpiresAt !== null && cg.verificationExpiresAt <= now,
+        eligibleForStaffing: isCaregiverEligibleForStaffing(cg, now),
+        verifiedByEmail: reviewer?.email ?? null,
+        verifiedAt: cg.verifiedAt ? cg.verifiedAt.toISOString() : null,
+        verificationExpiresAt: cg.verificationExpiresAt
+          ? cg.verificationExpiresAt.toISOString()
+          : null,
+        reviewComments: cg.reviewComments ?? verifRecord?.reviewComments ?? null,
+        rejectionReason:
+          cg.rejectionReason ?? verifRecord?.rejectionReason ?? null,
+        approvalEligibility: {
+          eligible: blockingReasons.length === 0,
+          reasons: blockingReasons,
+          blockingReasons,
+          verifiedDocumentsCount: validDocs.length,
+          totalDocumentsCount: cgDocs.length,
+        },
+        documents: cgDocs.map((d) => ({
+          id: d.id,
+          documentType: d.documentType,
+          documentTitle: d.documentTitle,
+          status:
+            d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
+              ? "EXPIRED"
+              : d.status,
+          expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
+        })),
+        history,
+        reviewHistory: history,
+        createdAt: cg.createdAt.toISOString(),
+      };
+    })
+    .filter((item) => {
+      if (
+        filters.status &&
+        filters.status !== "ALL" &&
+        item.status !== filters.status
+      ) {
+        return false;
+      }
+      if (
+        filters.centerId &&
+        filters.centerId !== "ALL" &&
+        item.centerId !== filters.centerId
+      ) {
+        return false;
+      }
+      if (
+        search &&
+        !item.fullName.toLowerCase().includes(search) &&
+        !item.email.toLowerCase().includes(search) &&
+        !item.centerName.toLowerCase().includes(search)
+      ) {
+        return false;
+      }
+      return true;
+    });
+}
+
+export async function getAdminCaregiverVerificationById(
+  idOrCaregiverId: string
+) {
+  const items = await listAdminCaregiverVerifications({});
+  const match = items.find(
+    (item) => item.id === idOrCaregiverId || item.caregiverId === idOrCaregiverId
+  );
+  if (!match) {
+    throw new AdminAuthError(
+      "CAREGIVER_NOT_FOUND",
+      "Caregiver verification record not found.",
+      404
+    );
+  }
+  return match;
+}
+
+export async function approveCaregiverVerification(params: {
+  idOrCaregiverId: string;
+  reviewComments: string;
+  checklistState?: Record<string, boolean>;
+  expiresAt?: string;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const trimmedComments = (params.reviewComments || "").trim();
+  if (trimmedComments.length < 3) {
+    throw new AdminAuthError(
+      "REVIEW_COMMENTS_REQUIRED",
+      "Review comments of at least 3 characters are required when approving caregiver screening.",
+      400
+    );
+  }
+
+  const now = new Date();
+  const expiresAt = params.expiresAt
+    ? new Date(params.expiresAt)
+    : new Date(now.getTime() + 365 * 86_400_000);
+
+  if (expiresAt <= now) {
+    throw new AdminAuthError(
+      "INVALID_EXPIRATION_DATE",
+      "Caregiver verification expiration date must be in the future.",
+      400
+    );
+  }
+
+  const txResult = await db.transaction(async (tx) => {
+    const existingVerifs = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(caregiverVerifications)
+        .where(eq(caregiverVerifications.id, params.idOrCaregiverId))
+    );
+    const resolvedCaregiverId =
+      existingVerifs[0]?.caregiverId ?? params.idOrCaregiverId;
+
+    const [caregiver] = await tx
+      .select()
+      .from(caregivers)
+      .where(eq(caregivers.id, resolvedCaregiverId))
+      .limit(1);
+
+    if (!caregiver) {
+      throw new AdminAuthError(
+        "CAREGIVER_NOT_FOUND",
+        "Caregiver record not found.",
+        404
+      );
+    }
+
+    const [center] = await tx
+      .select()
+      .from(centers)
+      .where(eq(centers.id, caregiver.centerId))
+      .limit(1);
+
+    const [provider] = center
+      ? await tx
+          .select()
+          .from(providers)
+          .where(eq(providers.id, center.providerId))
+          .limit(1)
+      : [null];
+
+    // Prevent self-approval by caregiver or provider owner
+    if (
+      caregiver.userId === params.admin.id ||
+      caregiver.email.trim().toLowerCase() ===
+        params.admin.email.trim().toLowerCase() ||
+      (provider && provider.ownerUserId === params.admin.id)
+    ) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "Caregivers and provider owners cannot self-approve caregiver background screening.",
+        403
+      );
+    }
+
+    if (
+      !caregiver.isActive ||
+      caregiver.backgroundCheckStatus === "SUSPENDED"
+    ) {
+      throw new AdminAuthError(
+        "CAREGIVER_SUSPENDED_OR_INACTIVE",
+        "Suspended or inactive caregivers cannot be verified while under restriction.",
+        400
+      );
+    }
+
+    const byCg = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(caregiverVerifications)
+        .where(eq(caregiverVerifications.caregiverId, caregiver.id))
+    );
+    const verifRecord = existingVerifs[0] ?? byCg[0] ?? null;
+
+    const allProviderDocs = center
+      ? await tx
+          .select()
+          .from(verificationDocuments)
+          .where(eq(verificationDocuments.providerId, center.providerId))
+      : [];
+
+    const cgDocs = allProviderDocs.filter(
+      (d) =>
+        d.caregiverId === caregiver.id ||
+        (verifRecord?.documentReferences ?? []).includes(d.id)
+    );
+
+    if (cgDocs.length === 0) {
+      throw new AdminAuthError(
+        "CAREGIVER_EVIDENCE_REQUIRED",
+        "Caregiver verification requires at least one submitted and verified screening document.",
+        400
+      );
+    }
+
+    const rejectedDocs = cgDocs.filter((d) => d.status === "REJECTED");
+    if (rejectedDocs.length > 0) {
+      throw new AdminAuthError(
+        "CAREGIVER_DOCUMENT_REJECTED",
+        "Cannot approve caregiver screening while a submitted caregiver document is REJECTED.",
+        400
+      );
+    }
+
+    const expiredDocs = cgDocs.filter(
+      (d) => d.status === "EXPIRED" || (d.expiresAt !== null && d.expiresAt <= now)
+    );
+    if (expiredDocs.length > 0) {
+      throw new AdminAuthError(
+        "CAREGIVER_DOCUMENT_EXPIRED",
+        "Cannot approve caregiver screening with expired supporting document(s).",
+        400
+      );
+    }
+
+    const validDocs = cgDocs.filter((d) => isDocumentCurrentlyValid(d, now));
+    if (validDocs.length === 0 || validDocs.length < cgDocs.length) {
+      throw new AdminAuthError(
+        "CAREGIVER_DOCUMENTS_UNVERIFIED",
+        "All submitted caregiver screening documents must be individually VERIFIED before caregiver approval.",
+        400
+      );
+    }
+
+    const updatedCaregivers = await tx
+      .update(caregivers)
+      .set({
+        backgroundCheckStatus: "VERIFIED",
+        verifiedBy: params.admin.id,
+        verifiedAt: now,
+        verificationExpiresAt: expiresAt,
+        reviewComments: trimmedComments,
+        rejectionReason: null,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(caregivers.id, caregiver.id),
+          eq(caregivers.backgroundCheckStatus, caregiver.backgroundCheckStatus)
+        )
+      )
+      .returning();
+
+    if (updatedCaregivers.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent caregiver verification decision detected.",
+        409
+      );
+    }
+
+    let verifId = verifRecord?.id ?? caregiver.id;
+    if (verifRecord) {
+      await tx
+        .update(caregiverVerifications)
+        .set({
+          status: "VERIFIED",
+          reviewerId: params.admin.id,
+          reviewedAt: now,
+          reviewComments: trimmedComments,
+          rejectionReason: null,
+          checklistState: params.checklistState ?? verifRecord.checklistState,
+          expiresAt,
+          updatedAt: now,
+        })
+        .where(eq(caregiverVerifications.id, verifRecord.id));
+    } else if (center) {
+      const [inserted] = await tx
+        .insert(caregiverVerifications)
+        .values({
+          caregiverId: caregiver.id,
+          centerId: center.id,
+          providerId: center.providerId,
+          status: "VERIFIED",
+          reviewerId: params.admin.id,
+          submittedAt: caregiver.createdAt,
+          reviewedAt: now,
+          reviewComments: trimmedComments,
+          documentReferences: validDocs.map((d) => d.id),
+          checklistState: params.checklistState ?? {},
+          expiresAt,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({ id: caregiverVerifications.id });
+      if (inserted) verifId = inserted.id;
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "CAREGIVER",
+      subjectId: caregiver.id,
+      verificationId: verifId,
+      previousStatus: caregiver.backgroundCheckStatus,
+      newStatus: "VERIFIED",
+      decision: "VERIFIED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: trimmedComments,
+      evidenceSnapshot: {
+        verifiedDocumentIds: validDocs.map((d) => d.id),
+        expiresAt: expiresAt.toISOString(),
+      },
+      createdAt: now,
+    });
+
+    return { caregiver, verifId };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: "CAREGIVER_VERIFICATION_APPROVED",
+    entityType: "CAREGIVER_VERIFICATION",
+    entityId: txResult.caregiver.id,
+    summary: `Verified caregiver screening for ${txResult.caregiver.fullName} (${txResult.caregiver.email}). Comments: ${trimmedComments}`,
+    previousState: {
+      backgroundCheckStatus: txResult.caregiver.backgroundCheckStatus,
+    },
+    newState: {
+      backgroundCheckStatus: "VERIFIED",
+      verificationExpiresAt: expiresAt.toISOString(),
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    verificationId: txResult.verifId,
+    caregiverId: txResult.caregiver.id,
+    status: "VERIFIED" as const,
+    expiresAt: expiresAt.toISOString(),
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+export async function rejectCaregiverVerification(params: {
+  idOrCaregiverId: string;
+  rejectionReason: string;
+  reviewComments?: string;
+  suspendCaregiver?: boolean;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const now = new Date();
+  const nextStatus: CaregiverVerificationStatus = params.suspendCaregiver
+    ? "SUSPENDED"
+    : "REJECTED";
+
+  const txResult = await db.transaction(async (tx) => {
+    const existingVerifs = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(caregiverVerifications)
+        .where(eq(caregiverVerifications.id, params.idOrCaregiverId))
+    );
+    const resolvedCaregiverId =
+      existingVerifs[0]?.caregiverId ?? params.idOrCaregiverId;
+
+    const [caregiver] = await tx
+      .select()
+      .from(caregivers)
+      .where(eq(caregivers.id, resolvedCaregiverId))
+      .limit(1);
+
+    if (!caregiver) {
+      throw new AdminAuthError(
+        "CAREGIVER_NOT_FOUND",
+        "Caregiver record not found.",
+        404
+      );
+    }
+
+    if (
+      caregiver.userId === params.admin.id ||
+      caregiver.email.trim().toLowerCase() ===
+        params.admin.email.trim().toLowerCase()
+    ) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "Caregivers cannot review their own verification status.",
+        403
+      );
+    }
+
+    const updatedCaregivers = await tx
+      .update(caregivers)
+      .set({
+        backgroundCheckStatus: nextStatus,
+        isActive: params.suspendCaregiver ? false : caregiver.isActive,
+        verifiedBy: params.admin.id,
+        verifiedAt: now,
+        rejectionReason: params.rejectionReason,
+        reviewComments: params.reviewComments ?? params.rejectionReason,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(caregivers.id, caregiver.id),
+          eq(caregivers.backgroundCheckStatus, caregiver.backgroundCheckStatus)
+        )
+      )
+      .returning();
+
+    if (updatedCaregivers.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent caregiver verification decision detected.",
+        409
+      );
+    }
+
+    const [center] = await tx
+      .select()
+      .from(centers)
+      .where(eq(centers.id, caregiver.centerId))
+      .limit(1);
+
+    const byCg = await safeSelectTable(() =>
+      tx
+        .select()
+        .from(caregiverVerifications)
+        .where(eq(caregiverVerifications.caregiverId, caregiver.id))
+    );
+    const verifRecord = existingVerifs[0] ?? byCg[0] ?? null;
+    let verifId = verifRecord?.id ?? caregiver.id;
+
+    if (verifRecord) {
+      await tx
+        .update(caregiverVerifications)
+        .set({
+          status: nextStatus,
+          reviewerId: params.admin.id,
+          reviewedAt: now,
+          rejectionReason: params.rejectionReason,
+          reviewComments: params.reviewComments ?? params.rejectionReason,
+          updatedAt: now,
+        })
+        .where(eq(caregiverVerifications.id, verifRecord.id));
+    } else if (center) {
+      const [inserted] = await tx
+        .insert(caregiverVerifications)
+        .values({
+          caregiverId: caregiver.id,
+          centerId: center.id,
+          providerId: center.providerId,
+          status: nextStatus,
+          reviewerId: params.admin.id,
+          submittedAt: caregiver.createdAt,
+          reviewedAt: now,
+          rejectionReason: params.rejectionReason,
+          reviewComments: params.reviewComments ?? params.rejectionReason,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning({ id: caregiverVerifications.id });
+      if (inserted) verifId = inserted.id;
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "CAREGIVER",
+      subjectId: caregiver.id,
+      verificationId: verifId,
+      previousStatus: caregiver.backgroundCheckStatus,
+      newStatus: nextStatus,
+      decision: nextStatus,
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: params.reviewComments ?? params.rejectionReason,
+      rejectionReason: params.rejectionReason,
+      createdAt: now,
+    });
+
+    return { caregiver, verifId };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: params.suspendCaregiver
+      ? "CAREGIVER_VERIFICATION_SUSPENDED"
+      : "CAREGIVER_VERIFICATION_REJECTED",
+    entityType: "CAREGIVER_VERIFICATION",
+    entityId: txResult.caregiver.id,
+    summary: `${nextStatus} caregiver screening for ${txResult.caregiver.fullName}. Reason: ${params.rejectionReason}`,
+    previousState: {
+      backgroundCheckStatus: txResult.caregiver.backgroundCheckStatus,
+    },
+    newState: {
+      backgroundCheckStatus: nextStatus,
+      rejectionReason: params.rejectionReason,
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    verificationId: txResult.verifId,
+    caregiverId: txResult.caregiver.id,
+    status: nextStatus,
+    rejectionReason: params.rejectionReason,
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+export async function listAdminVerificationDocuments(filters: {
+  status?: string;
+  providerId?: string;
+  centerId?: string;
+  caregiverId?: string;
+  search?: string;
+}) {
+  const [allDocs, allProviders, allCenters, allCaregivers, allUsers] =
+    await Promise.all([
+      db
+        .select()
+        .from(verificationDocuments)
+        .orderBy(desc(verificationDocuments.createdAt)),
+      db.select().from(providers),
+      db.select().from(centers),
+      db.select().from(caregivers),
+      db.select().from(users),
+    ]);
+
+  const providerMap = new Map(allProviders.map((p) => [p.id, p]));
+  const centerMap = new Map(allCenters.map((c) => [c.id, c]));
+  const caregiverMap = new Map(allCaregivers.map((cg) => [cg.id, cg]));
+  const userMap = new Map(allUsers.map((u) => [u.id, u]));
+  const search = (filters.search || "").trim().toLowerCase();
+  const now = new Date();
+
+  return allDocs
+    .map((d) => {
+      const prov = providerMap.get(d.providerId);
+      const center = d.centerId ? centerMap.get(d.centerId) : null;
+      const cg = d.caregiverId ? caregiverMap.get(d.caregiverId) : null;
+      const reviewer = d.reviewedBy ? userMap.get(d.reviewedBy) : null;
+      const isExpired = d.expiresAt !== null && d.expiresAt <= now;
+      const effectiveStatus: DocumentVerificationStatus =
+        isExpired && d.status !== "REJECTED"
+          ? "EXPIRED"
+          : (d.status as DocumentVerificationStatus);
+
+      return {
+        id: d.id,
+        providerId: d.providerId,
+        providerName: prov?.organizationName ?? "Unknown Provider",
+        centerId: d.centerId,
+        centerName: center?.name ?? null,
+        caregiverId: d.caregiverId ?? null,
+        caregiverName: cg?.fullName ?? null,
+        documentCategory:
+          d.documentCategory ??
+          (d.caregiverId ? "CAREGIVER" : d.centerId ? "CENTER" : "PROVIDER"),
+        documentType: d.documentType,
+        documentTitle: d.documentTitle,
+        mimeType: d.mimeType,
+        fileSizeBytes: d.fileSizeBytes,
+        checksumSha256: d.checksumSha256,
+        malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+        status: effectiveStatus,
+        isExpired,
+        expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
+        reviewedByEmail: reviewer?.email ?? null,
+        reviewedAt: d.reviewedAt ? d.reviewedAt.toISOString() : null,
+        reviewNotes: d.reviewNotes,
+        rejectionReason: d.rejectionReason ?? null,
+        replacementRequested: d.replacementRequested ?? false,
+        accessUrl: buildPrivateDocumentAccessDescriptor(d.id),
+        createdAt: d.createdAt.toISOString(),
+      };
+    })
+    .filter((item) => {
+      if (
+        filters.status &&
+        filters.status !== "ALL" &&
+        item.status !== filters.status
+      ) {
+        return false;
+      }
+      if (filters.providerId && item.providerId !== filters.providerId) {
+        return false;
+      }
+      if (filters.centerId && item.centerId !== filters.centerId) {
+        return false;
+      }
+      if (filters.caregiverId && item.caregiverId !== filters.caregiverId) {
+        return false;
+      }
+      if (
+        search &&
+        !item.documentTitle.toLowerCase().includes(search) &&
+        !item.documentType.toLowerCase().includes(search) &&
+        !item.providerName.toLowerCase().includes(search)
+      ) {
+        return false;
+      }
+      return true;
+    });
+}
+
+export async function getAdminVerificationDocumentById(docId: string) {
+  const [docs, historyRows] = await Promise.all([
+    listAdminVerificationDocuments({}),
+    safeSelectTable(() =>
+      db
+        .select()
+        .from(verificationReviewHistory)
+        .orderBy(desc(verificationReviewHistory.createdAt))
+    ),
+  ]);
+
+  const doc = docs.find((d) => d.id === docId);
+  if (!doc) {
+    throw new AdminAuthError(
+      "DOCUMENT_NOT_FOUND",
+      "Verification document not found.",
+      404
+    );
+  }
+
+  const history = historyRows
+    .filter((h) => h.subjectType === "DOCUMENT" && h.subjectId === doc.id)
+    .map((h) => ({
+      id: h.id,
+      previousStatus: h.previousStatus,
+      newStatus: h.newStatus,
+      decision: h.decision,
+      reviewerEmail: h.reviewerEmail,
+      reviewComments: h.reviewComments,
+      rejectionReason: h.rejectionReason,
+      createdAt: h.createdAt.toISOString(),
+    }));
+
+  return {
+    ...doc,
+    history,
+  };
+}
+
+export async function approveVerificationDocument(params: {
+  documentId: string;
+  reviewNotes: string;
+  expiresAt?: string;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const trimmedNotes = (params.reviewNotes || "").trim();
+  if (trimmedNotes.length < 3) {
+    throw new AdminAuthError(
+      "REVIEW_NOTES_REQUIRED",
+      "Review notes of at least 3 characters are required when approving a document.",
+      400
+    );
+  }
+
+  const now = new Date();
+
+  const txResult = await db.transaction(async (tx) => {
+    const [doc] = await tx
+      .select()
+      .from(verificationDocuments)
+      .where(eq(verificationDocuments.id, params.documentId))
+      .limit(1);
+
+    if (!doc) {
+      throw new AdminAuthError(
+        "DOCUMENT_NOT_FOUND",
+        "Verification document not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, doc.providerId))
+      .limit(1);
+
+    if (
+      doc.uploadedBy === params.admin.id ||
+      (provider && provider.ownerUserId === params.admin.id)
+    ) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "Document uploaders and provider owners cannot self-verify their own documents.",
+        403
+      );
+    }
+
+    if (!ALLOWED_DOCUMENT_MIME_TYPES.has(doc.mimeType)) {
+      throw new AdminAuthError(
+        "INVALID_DOCUMENT_TYPE",
+        `Unsupported document MIME type '${doc.mimeType}'. Allowed types: PDF, PNG, JPEG.`,
+        400
+      );
+    }
+
+    if (
+      doc.fileSizeBytes < 0 ||
+      doc.fileSizeBytes > MAX_DOCUMENT_SIZE_BYTES
+    ) {
+      throw new AdminAuthError(
+        "INVALID_DOCUMENT_SIZE",
+        "Document file size is outside allowed compliance bounds (max 10 MB).",
+        400
+      );
+    }
+
+    const scanStatus = doc.malwareScanStatus ?? "CLEAN";
+    if (scanStatus !== "CLEAN") {
+      throw new AdminAuthError(
+        "DOCUMENT_MALWARE_SCAN_REQUIRED",
+        `Document cannot be verified until malware scanning completes with status CLEAN (current: ${scanStatus}).`,
+        400
+      );
+    }
+
+    const nextExpiresAt = params.expiresAt
+      ? new Date(params.expiresAt)
+      : doc.expiresAt;
+
+    if (nextExpiresAt && nextExpiresAt <= now) {
+      await tx
+        .update(verificationDocuments)
+        .set({ status: "EXPIRED", updatedAt: now })
+        .where(eq(verificationDocuments.id, doc.id));
+
+      throw new AdminAuthError(
+        "DOCUMENT_EXPIRED",
+        "Cannot verify an expired document. Please request a replacement document.",
+        400
+      );
+    }
+
+    if (doc.status === "VERIFIED") {
+      throw new AdminAuthError(
+        "DOCUMENT_ALREADY_VERIFIED",
+        "This document has already been verified.",
+        409
+      );
+    }
+
+    const updatedDocs = await tx
+      .update(verificationDocuments)
+      .set({
+        status: "VERIFIED",
+        reviewedBy: params.admin.id,
+        reviewedAt: now,
+        reviewNotes: trimmedNotes,
+        rejectionReason: null,
+        replacementRequested: false,
+        expiresAt: nextExpiresAt,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(verificationDocuments.id, doc.id),
+          eq(verificationDocuments.status, doc.status)
+        )
+      )
+      .returning();
+
+    if (updatedDocs.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent document review decision detected.",
+        409
+      );
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "DOCUMENT",
+      subjectId: doc.id,
+      previousStatus: doc.status,
+      newStatus: "VERIFIED",
+      decision: "VERIFIED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: trimmedNotes,
+      evidenceSnapshot: {
+        documentType: doc.documentType,
+        checksumSha256: doc.checksumSha256,
+      },
+      createdAt: now,
+    });
+
+    return { doc, nextExpiresAt };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: "VERIFICATION_DOCUMENT_APPROVED",
+    entityType: "VERIFICATION_DOCUMENT",
+    entityId: txResult.doc.id,
+    summary: `Verified document "${txResult.doc.documentTitle}" (${txResult.doc.documentType}). Notes: ${trimmedNotes}`,
+    previousState: { status: txResult.doc.status },
+    newState: {
+      status: "VERIFIED",
+      documentType: txResult.doc.documentType,
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    documentId: txResult.doc.id,
+    status: "VERIFIED" as const,
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
+  };
+}
+
+export async function rejectVerificationDocument(params: {
+  documentId: string;
+  rejectionReason: string;
+  reviewNotes?: string;
+  requestReplacement?: boolean;
+  admin: AuthenticatedAdmin;
+  ipAddress?: string;
+  userAgent?: string;
+}) {
+  const now = new Date();
+
+  const txResult = await db.transaction(async (tx) => {
+    const [doc] = await tx
+      .select()
+      .from(verificationDocuments)
+      .where(eq(verificationDocuments.id, params.documentId))
+      .limit(1);
+
+    if (!doc) {
+      throw new AdminAuthError(
+        "DOCUMENT_NOT_FOUND",
+        "Verification document not found.",
+        404
+      );
+    }
+
+    const [provider] = await tx
+      .select()
+      .from(providers)
+      .where(eq(providers.id, doc.providerId))
+      .limit(1);
+
+    if (
+      doc.uploadedBy === params.admin.id ||
+      (provider && provider.ownerUserId === params.admin.id)
+    ) {
+      throw new AdminAuthError(
+        "SELF_APPROVAL_FORBIDDEN",
+        "Document uploaders and provider owners cannot review their own documents.",
+        403
+      );
+    }
+
+    const updatedDocs = await tx
+      .update(verificationDocuments)
+      .set({
+        status: "REJECTED",
+        reviewedBy: params.admin.id,
+        reviewedAt: now,
+        rejectionReason: params.rejectionReason,
+        reviewNotes: params.reviewNotes ?? params.rejectionReason,
+        replacementRequested: Boolean(params.requestReplacement ?? true),
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(verificationDocuments.id, doc.id),
+          eq(verificationDocuments.status, doc.status)
+        )
+      )
+      .returning();
+
+    if (updatedDocs.length === 0) {
+      throw new AdminAuthError(
+        "VERIFICATION_CONFLICT",
+        "Concurrent document review decision detected.",
+        409
+      );
+    }
+
+    await appendVerificationReviewHistory(tx, {
+      subjectType: "DOCUMENT",
+      subjectId: doc.id,
+      previousStatus: doc.status,
+      newStatus: "REJECTED",
+      decision: "REJECTED",
+      reviewerId: params.admin.id,
+      reviewerEmail: params.admin.email,
+      reviewComments: params.reviewNotes ?? params.rejectionReason,
+      rejectionReason: params.rejectionReason,
+      evidenceSnapshot: {
+        documentType: doc.documentType,
+        replacementRequested: Boolean(params.requestReplacement ?? true),
+      },
+      createdAt: now,
+    });
+
+    return { doc };
+  });
+
+  await recordAdminAuditLog({
+    adminUserId: params.admin.id,
+    adminEmail: params.admin.email,
+    action: "VERIFICATION_DOCUMENT_REJECTED",
+    entityType: "VERIFICATION_DOCUMENT",
+    entityId: txResult.doc.id,
+    summary: `Rejected document "${txResult.doc.documentTitle}" (${txResult.doc.documentType}). Reason: ${params.rejectionReason}`,
+    previousState: { status: txResult.doc.status },
+    newState: {
+      status: "REJECTED",
+      rejectionReason: params.rejectionReason,
+      replacementRequested: Boolean(params.requestReplacement ?? true),
+    },
+    ipAddress: params.ipAddress,
+    userAgent: params.userAgent,
+  });
+
+  return {
+    documentId: txResult.doc.id,
+    status: "REJECTED" as const,
+    rejectionReason: params.rejectionReason,
+    replacementRequested: Boolean(params.requestReplacement ?? true),
+    reviewedBy: params.admin.email,
+    reviewedAt: now.toISOString(),
   };
 }
 
@@ -1342,6 +3899,38 @@ export async function transitionAdminBookingStatus(params: {
 
   if (!center) {
     throw new AdminAuthError("CENTER_NOT_FOUND", "Centre not found.", 404);
+  }
+
+  // Prevent suspended, rejected, or unverified centres from accepting or confirming bookings
+  if (params.toStatus === "CONFIRMED" || params.toStatus === "CHECKED_IN") {
+    if (
+      center.listingStatus !== "ACTIVE" ||
+      center.verificationStatus !== "APPROVED"
+    ) {
+      throw new AdminAuthError(
+        "CENTER_UNAVAILABLE_FOR_BOOKING",
+        `Cannot confirm or check in booking: ${center.name} is not an active, approved centre (listingStatus=${center.listingStatus}, verificationStatus=${center.verificationStatus}).`,
+        400
+      );
+    }
+
+    const [centerProvider] = await db
+      .select()
+      .from(providers)
+      .where(eq(providers.id, center.providerId))
+      .limit(1);
+
+    if (
+      !centerProvider ||
+      centerProvider.verificationStatus !== "APPROVED" ||
+      !centerProvider.subscriptionActive
+    ) {
+      throw new AdminAuthError(
+        "CENTER_UNAVAILABLE_FOR_BOOKING",
+        `Cannot confirm or check in booking: parent provider for ${center.name} is not active and approved.`,
+        400
+      );
+    }
   }
 
   // Enforce childcare capacity constraint when confirming or checking in
@@ -1945,4 +4534,40 @@ export async function updateAdminPlatformSettings(params: {
   });
 
   return getAdminPlatformSettings();
+}
+
+export async function inspectPhase2HistoricalDataImpact() {
+  const [allCaregivers, allCenters, allBookings, allAdmins] = await Promise.all([
+    db.select().from(caregivers),
+    db.select().from(centers),
+    db.select().from(bookings),
+    db.select().from(adminProfiles),
+  ]);
+
+  const unreviewedVerifiedCaregivers = allCaregivers.filter(
+    (c) => c.backgroundCheckStatus === "VERIFIED" && (!c.verifiedBy || !c.verifiedAt)
+  );
+  const unreviewedActiveCenters = allCenters.filter(
+    (c) =>
+      (c.listingStatus === "ACTIVE" || c.verificationStatus === "APPROVED") &&
+      (!c.verifiedBy || !c.verifiedAt)
+  );
+  const defaultRatedCenters = allCenters.filter((c) => c.rating === "4.80");
+  const unconfirmedPaidBookings = allBookings.filter(
+    (b) => b.paymentStatus === "PAID" && b.status !== "COMPLETED"
+  );
+
+  return {
+    totalCaregivers: allCaregivers.length,
+    unreviewedVerifiedCaregiverCount: unreviewedVerifiedCaregivers.length,
+    unreviewedVerifiedCaregiverIds: unreviewedVerifiedCaregivers.map((c) => c.id),
+    totalCenters: allCenters.length,
+    unreviewedActiveCenterCount: unreviewedActiveCenters.length,
+    unreviewedActiveCenterIds: unreviewedActiveCenters.map((c) => c.id),
+    defaultRatedCenterCount: defaultRatedCenters.length,
+    defaultRatedCenterIds: defaultRatedCenters.map((c) => c.id),
+    totalBookings: allBookings.length,
+    unconfirmedPaidBookingCount: unconfirmedPaidBookings.length,
+    totalAdminProfiles: allAdmins.length,
+  };
 }

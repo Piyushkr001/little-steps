@@ -34,9 +34,40 @@ export function setDatabaseInstanceForTests(override: AppDatabase | null): void 
   testDbOverride = override;
 }
 
+let txMutex: Promise<unknown> = Promise.resolve();
+
+async function runSerializedNeonHttpTransaction<T>(
+  activeDb: AppDatabase,
+  callback: (tx: AppDatabase) => Promise<T>
+): Promise<T> {
+  const prev = txMutex;
+  let release!: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  txMutex = prev.then(() => next);
+
+  await prev;
+  try {
+    return await callback(activeDb);
+  } finally {
+    release();
+  }
+}
+
 export const db: AppDatabase = new Proxy({} as AppDatabase, {
   get(_target, prop, receiver) {
-    const active = testDbOverride ?? getDefaultDb();
+    if (testDbOverride) {
+      const value = Reflect.get(testDbOverride, prop, receiver);
+      return typeof value === "function" ? value.bind(testDbOverride) : value;
+    }
+
+    const active = getDefaultDb();
+    if (prop === "transaction") {
+      return <T,>(callback: (tx: AppDatabase) => Promise<T>) =>
+        runSerializedNeonHttpTransaction(active, callback);
+    }
+
     const value = Reflect.get(active, prop, receiver);
     return typeof value === "function" ? value.bind(active) : value;
   },

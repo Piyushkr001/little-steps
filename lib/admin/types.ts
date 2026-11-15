@@ -26,6 +26,37 @@ export type VerificationStatus =
   | "EXPIRED"
   | "SUSPENDED";
 
+export type CaregiverVerificationStatus =
+  | "NOT_VERIFIED"
+  | "PENDING"
+  | "UNDER_REVIEW"
+  | "VERIFIED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "SUSPENDED";
+
+export type DocumentVerificationStatus =
+  | "SUBMITTED"
+  | "UNDER_REVIEW"
+  | "VERIFIED"
+  | "REJECTED"
+  | "EXPIRED";
+
+export type BookingPaymentStatus =
+  | "UNPAID"
+  | "PENDING"
+  | "PAID"
+  | "PARTIALLY_REFUNDED"
+  | "REFUNDED"
+  | "DISPUTED"
+  | "FAILED";
+
+export type VerificationSubjectType =
+  | "PROVIDER"
+  | "CENTER"
+  | "CAREGIVER"
+  | "DOCUMENT";
+
 export type CenterListingStatus =
   | "ACTIVE"
   | "SUSPENDED"

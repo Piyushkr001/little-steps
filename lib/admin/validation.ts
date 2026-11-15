@@ -74,6 +74,76 @@ export const requestDocumentsSchema = z.object({
     .max(1000),
 });
 
+export const approveCenterVerificationSchema = z.object({
+  reviewComments: z
+    .string()
+    .trim()
+    .min(3, "Review comments are required when approving a daycare centre")
+    .max(1000),
+  checklistState: z.record(z.string(), z.boolean()).optional(),
+  safetyComplianceNotes: z.string().trim().max(1000).optional(),
+  activateListing: z.boolean().optional(),
+});
+
+export const rejectCenterVerificationSchema = z.object({
+  rejectionReason: z
+    .string()
+    .trim()
+    .min(5, "A detailed rejection or suspension reason is required")
+    .max(1000),
+  reviewComments: z.string().trim().max(1000).optional(),
+  suspendCenter: z.boolean().optional(),
+});
+
+export const requestCenterDocumentsSchema = z.object({
+  requestedDocuments: z
+    .array(z.string().trim().min(2))
+    .min(1, "Specify at least one required centre document"),
+  reviewComments: z
+    .string()
+    .trim()
+    .min(5, "Explain what additional centre documentation is required")
+    .max(1000),
+});
+
+export const approveCaregiverVerificationSchema = z.object({
+  reviewComments: z
+    .string()
+    .trim()
+    .min(3, "Review comments are required when approving caregiver screening")
+    .max(1000),
+  checklistState: z.record(z.string(), z.boolean()).optional(),
+  expiresAt: z.string().datetime().optional(),
+});
+
+export const rejectCaregiverVerificationSchema = z.object({
+  rejectionReason: z
+    .string()
+    .trim()
+    .min(5, "A detailed rejection or suspension reason is required")
+    .max(1000),
+  reviewComments: z.string().trim().max(1000).optional(),
+  suspendCaregiver: z.boolean().optional(),
+});
+
+export const approveVerificationDocumentSchema = z.object({
+  reviewNotes: z.string().trim().min(3).max(1000).optional(),
+  reviewComments: z.string().trim().min(3).max(1000).optional(),
+  expiresAt: z.string().datetime().optional(),
+});
+
+export const rejectVerificationDocumentSchema = z.object({
+  rejectionReason: z
+    .string()
+    .trim()
+    .min(5, "A rejection reason is required when rejecting a document")
+    .max(1000),
+  reviewNotes: z.string().trim().max(1000).optional(),
+  reviewComments: z.string().trim().max(1000).optional(),
+  requestReplacement: z.boolean().optional(),
+  replacementRequested: z.boolean().optional(),
+});
+
 export const updateCenterStatusSchema = z.object({
   listingStatus: z.enum(["ACTIVE", "SUSPENDED", "INACTIVE", "PENDING_APPROVAL"]),
   reason: z

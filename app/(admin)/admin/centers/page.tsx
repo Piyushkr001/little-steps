@@ -179,6 +179,7 @@ export default function AdminCentersPage() {
               className="h-9 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-800 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-100"
             >
               <option value="">All Listing Statuses</option>
+              <option value="PENDING_APPROVAL">Pending Approval</option>
               <option value="ACTIVE">Active Listing</option>
               <option value="INACTIVE">Inactive Listing</option>
               <option value="SUSPENDED">Suspended Listing</option>
@@ -192,6 +193,7 @@ export default function AdminCentersPage() {
               <option value="APPROVED">Approved</option>
               <option value="UNDER_REVIEW">Under Review</option>
               <option value="PENDING">Pending</option>
+              <option value="REJECTED">Rejected</option>
               <option value="SUSPENDED">Suspended</option>
             </select>
           </div>
@@ -265,7 +267,18 @@ export default function AdminCentersPage() {
                     </span>
                     <span className="inline-flex items-center gap-1">
                       <Users className="h-3.5 w-3.5 text-slate-400" />
+                      {center.verifiedCaregiversCount ?? 0} /{" "}
                       {center.caregiversCount} Verified Caregivers
+                    </span>
+                    <span className="inline-flex items-center gap-1 font-medium">
+                      Rating:{" "}
+                      {center.rating ? (
+                        <strong className="text-[#087F78]">
+                          ★ {center.rating}
+                        </strong>
+                      ) : (
+                        <span className="italic text-slate-400">Unrated</span>
+                      )}
                     </span>
                   </div>
 
@@ -423,6 +436,23 @@ export default function AdminCentersPage() {
                   </p>
                 </div>
               </div>
+
+              {selectedCenter.approvalEligibility &&
+                !selectedCenter.approvalEligibility.eligible &&
+                selectedCenter.approvalEligibility.reasons.length > 0 && (
+                  <div className="rounded-xl border border-amber-200 bg-amber-50/70 p-3 text-amber-900 dark:border-amber-900/50 dark:bg-amber-950/30 dark:text-amber-200">
+                    <p className="font-bold">
+                      Independent Activation Eligibility Blockers:
+                    </p>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                      {selectedCenter.approvalEligibility.reasons.map(
+                        (r, idx) => (
+                          <li key={idx}>{r}</li>
+                        )
+                      )}
+                    </ul>
+                  </div>
+                )}
 
               {/* Operating Hours */}
               <div>

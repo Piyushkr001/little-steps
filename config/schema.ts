@@ -1,5 +1,7 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   index,
   integer,
   jsonb,
@@ -143,7 +145,7 @@ export const adminProfiles = pgTable(
     title: varchar("title", { length: 120 })
       .notNull()
       .default("Platform Administrator"),
-    isApproved: boolean("is_approved").notNull().default(true),
+    isApproved: boolean("is_approved").notNull().default(false),
     permissions: jsonb("permissions").$type<string[]>().notNull().default([]),
     provisionedBy: uuid("provisioned_by").references(() => users.id, {
       onDelete: "set null",
@@ -315,9 +317,18 @@ export const centers = pgTable(
       .default("PENDING"),
     listingStatus: centerListingStatusEnum("listing_status")
       .notNull()
-      .default("ACTIVE"),
+      .default("PENDING_APPROVAL"),
     suspendedReason: text("suspended_reason"),
-    rating: numeric("rating", { precision: 3, scale: 2 }).default("4.80"),
+    rating: numeric("rating", { precision: 3, scale: 2 }),
+    verifiedBy: uuid("verified_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    verificationExpiresAt: timestamp("verification_expires_at", {
+      withTimezone: true,
+    }),
+    reviewComments: text("review_comments"),
+    rejectionReason: text("rejection_reason"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
@@ -330,6 +341,14 @@ export const centers = pgTable(
     index("centers_listing_status_idx").on(t.listingStatus),
     index("centers_verification_status_idx").on(t.verificationStatus),
     index("centers_city_idx").on(t.city),
+    check("centers_approved_capacity_nonneg", sql`${t.approvedCapacity} >= 0`),
+    check("centers_current_occupancy_nonneg", sql`${t.currentOccupancy} >= 0`),
+    check("centers_hourly_rate_nonneg", sql`${t.hourlyRate} >= 0`),
+    check("centers_daily_rate_nonneg", sql`${t.dailyRate} >= 0`),
+    check(
+      "centers_rating_range_chk",
+      sql`${t.rating} IS NULL OR (${t.rating} >= 0 AND ${t.rating} <= 5)`
+    ),
   ]
 );
 
@@ -355,14 +374,34 @@ export const caregivers = pgTable(
       .default([]),
     backgroundCheckStatus: varchar("background_check_status", { length: 50 })
       .notNull()
-      .default("VERIFIED"),
+      .default("NOT_VERIFIED"),
     yearsExperience: integer("years_experience").notNull().default(2),
     isActive: boolean("is_active").notNull().default(true),
+    verifiedBy: uuid("verified_by").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    verifiedAt: timestamp("verified_at", { withTimezone: true }),
+    verificationExpiresAt: timestamp("verification_expires_at", {
+      withTimezone: true,
+    }),
+    reviewComments: text("review_comments"),
+    rejectionReason: text("rejection_reason"),
     createdAt: timestamp("created_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
-  (t) => [index("caregivers_center_id_idx").on(t.centerId)]
+  (t) => [
+    index("caregivers_center_id_idx").on(t.centerId),
+    index("caregivers_bg_status_idx").on(t.backgroundCheckStatus),
+    check("caregivers_years_exp_nonneg", sql`${t.yearsExperience} >= 0`),
+    check(
+      "caregivers_bg_status_valid",
+      sql`${t.backgroundCheckStatus} IN ('NOT_VERIFIED', 'PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED', 'SUSPENDED')`
+    ),
+  ]
 );
 
 export const verificationDocuments = pgTable(
@@ -375,6 +414,12 @@ export const verificationDocuments = pgTable(
     centerId: uuid("center_id").references(() => centers.id, {
       onDelete: "set null",
     }),
+    caregiverId: uuid("caregiver_id").references(() => caregivers.id, {
+      onDelete: "set null",
+    }),
+    documentCategory: varchar("document_category", { length: 60 })
+      .notNull()
+      .default("PROVIDER"),
     documentType: varchar("document_type", { length: 100 }).notNull(),
     documentTitle: varchar("document_title", { length: 255 }).notNull(),
     storageReference: varchar("storage_reference", { length: 500 }).notNull(),
@@ -383,6 +428,9 @@ export const verificationDocuments = pgTable(
       .default("application/pdf"),
     fileSizeBytes: integer("file_size_bytes").notNull().default(0),
     checksumSha256: varchar("checksum_sha256", { length: 128 }),
+    malwareScanStatus: varchar("malware_scan_status", { length: 50 })
+      .notNull()
+      .default("CLEAN"),
     status: varchar("status", { length: 50 }).notNull().default("SUBMITTED"),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     uploadedBy: uuid("uploaded_by").references(() => users.id, {
@@ -393,13 +441,27 @@ export const verificationDocuments = pgTable(
     }),
     reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
     reviewNotes: text("review_notes"),
+    rejectionReason: text("rejection_reason"),
+    replacementRequested: boolean("replacement_requested")
+      .notNull()
+      .default(false),
     createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
       .defaultNow()
       .notNull(),
   },
   (t) => [
     index("verification_documents_provider_id_idx").on(t.providerId),
+    index("verification_documents_center_id_idx").on(t.centerId),
+    index("verification_documents_caregiver_id_idx").on(t.caregiverId),
     index("verification_documents_status_idx").on(t.status),
+    check("verification_documents_size_nonneg", sql`${t.fileSizeBytes} >= 0`),
+    check(
+      "verification_documents_status_valid",
+      sql`${t.status} IN ('SUBMITTED', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED')`
+    ),
   ]
 );
 
@@ -444,6 +506,146 @@ export const providerVerifications = pgTable(
     index("provider_verifications_provider_id_idx").on(t.providerId),
     index("provider_verifications_status_idx").on(t.status),
     index("provider_verifications_reviewer_id_idx").on(t.reviewerId),
+  ]
+);
+
+export const centerVerifications = pgTable(
+  "center_verifications",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    centerId: uuid("center_id")
+      .notNull()
+      .references(() => centers.id, { onDelete: "cascade" }),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => providers.id, { onDelete: "cascade" }),
+    status: verificationStatusEnum("status").notNull().default("PENDING"),
+    reviewerId: uuid("reviewer_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    submittedAt: timestamp("submitted_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    reviewComments: text("review_comments"),
+    rejectionReason: text("rejection_reason"),
+    requestedDocuments: jsonb("requested_documents")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    documentReferences: jsonb("document_references")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    checklistState: jsonb("checklist_state")
+      .$type<Record<string, boolean>>()
+      .notNull()
+      .default({}),
+    safetyComplianceNotes: text("safety_compliance_notes"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("center_verifications_center_id_idx").on(t.centerId),
+    index("center_verifications_provider_id_idx").on(t.providerId),
+    index("center_verifications_status_idx").on(t.status),
+    index("center_verifications_reviewer_id_idx").on(t.reviewerId),
+  ]
+);
+
+export const caregiverVerifications = pgTable(
+  "caregiver_verifications",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    caregiverId: uuid("caregiver_id")
+      .notNull()
+      .references(() => caregivers.id, { onDelete: "cascade" }),
+    centerId: uuid("center_id")
+      .notNull()
+      .references(() => centers.id, { onDelete: "cascade" }),
+    providerId: uuid("provider_id")
+      .notNull()
+      .references(() => providers.id, { onDelete: "cascade" }),
+    status: varchar("status", { length: 50 }).notNull().default("NOT_VERIFIED"),
+    reviewerId: uuid("reviewer_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    submittedAt: timestamp("submitted_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    reviewedAt: timestamp("reviewed_at", { withTimezone: true }),
+    reviewComments: text("review_comments"),
+    rejectionReason: text("rejection_reason"),
+    documentReferences: jsonb("document_references")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    checklistState: jsonb("checklist_state")
+      .$type<Record<string, boolean>>()
+      .notNull()
+      .default({}),
+    expiresAt: timestamp("expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("caregiver_verifications_caregiver_id_idx").on(t.caregiverId),
+    index("caregiver_verifications_center_id_idx").on(t.centerId),
+    index("caregiver_verifications_provider_id_idx").on(t.providerId),
+    index("caregiver_verifications_status_idx").on(t.status),
+    check(
+      "caregiver_verifications_status_valid",
+      sql`${t.status} IN ('NOT_VERIFIED', 'PENDING', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED', 'SUSPENDED')`
+    ),
+  ]
+);
+
+export const verificationReviewHistory = pgTable(
+  "verification_review_history",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    subjectType: varchar("subject_type", { length: 50 }).notNull(),
+    subjectId: uuid("subject_id").notNull(),
+    verificationId: uuid("verification_id"),
+    previousStatus: varchar("previous_status", { length: 50 }),
+    newStatus: varchar("new_status", { length: 50 }).notNull(),
+    decision: varchar("decision", { length: 60 }).notNull(),
+    reviewerId: uuid("reviewer_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    reviewerEmail: varchar("reviewer_email", { length: 255 }).notNull(),
+    reviewComments: text("review_comments"),
+    rejectionReason: text("rejection_reason"),
+    evidenceSnapshot: jsonb("evidence_snapshot")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (t) => [
+    index("verification_review_history_subject_idx").on(
+      t.subjectType,
+      t.subjectId
+    ),
+    index("verification_review_history_verification_id_idx").on(
+      t.verificationId
+    ),
+    index("verification_review_history_created_at_idx").on(t.createdAt),
+    check(
+      "verification_review_history_subject_type_valid",
+      sql`${t.subjectType} IN ('PROVIDER', 'CENTER', 'CAREGIVER', 'DOCUMENT')`
+    ),
   ]
 );
 
@@ -498,7 +700,7 @@ export const bookings = pgTable(
     totalAmount: numeric("total_amount", { precision: 10, scale: 2 }).notNull(),
     paymentStatus: varchar("payment_status", { length: 50 })
       .notNull()
-      .default("PAID"),
+      .default("PENDING"),
     hasConflict: boolean("has_conflict").notNull().default(false),
     cancellationReason: text("cancellation_reason"),
     notes: text("notes"),
@@ -515,6 +717,12 @@ export const bookings = pgTable(
     index("bookings_provider_id_idx").on(t.providerId),
     index("bookings_parent_id_idx").on(t.parentId),
     index("bookings_start_time_idx").on(t.startTime),
+    check("bookings_total_amount_nonneg", sql`${t.totalAmount} >= 0`),
+    check("bookings_valid_time_range", sql`${t.endTime} > ${t.startTime}`),
+    check(
+      "bookings_payment_status_valid",
+      sql`${t.paymentStatus} IN ('UNPAID', 'PENDING', 'PAID', 'PARTIALLY_REFUNDED', 'REFUNDED', 'DISPUTED', 'FAILED')`
+    ),
   ]
 );
 
@@ -555,7 +763,10 @@ export const capacityRules = pgTable(
       .defaultNow()
       .notNull(),
   },
-  (t) => [index("capacity_rules_center_id_idx").on(t.centerId)]
+  (t) => [
+    index("capacity_rules_center_id_idx").on(t.centerId),
+    check("capacity_rules_max_children_pos", sql`${t.maxChildren} > 0`),
+  ]
 );
 
 // ==========================================
@@ -746,6 +957,10 @@ export type Center = typeof centers.$inferSelect;
 export type Caregiver = typeof caregivers.$inferSelect;
 export type VerificationDocument = typeof verificationDocuments.$inferSelect;
 export type ProviderVerification = typeof providerVerifications.$inferSelect;
+export type CenterVerification = typeof centerVerifications.$inferSelect;
+export type CaregiverVerification = typeof caregiverVerifications.$inferSelect;
+export type VerificationReviewHistoryItem =
+  typeof verificationReviewHistory.$inferSelect;
 export type Child = typeof children.$inferSelect;
 export type Booking = typeof bookings.$inferSelect;
 export type BookingStatusHistoryItem = typeof bookingStatusHistory.$inferSelect;

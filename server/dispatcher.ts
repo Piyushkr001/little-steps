@@ -2,8 +2,15 @@ import { ZodError } from "zod";
 import type { AdminPermission, AuthenticatedAdmin } from "../lib/admin/types";
 import {
   addIncidentNoteSchema,
+  approveCaregiverVerificationSchema,
+  approveCenterVerificationSchema,
+  approveVerificationDocumentSchema,
   approveVerificationSchema,
+  rejectCaregiverVerificationSchema,
+  rejectCenterVerificationSchema,
+  rejectVerificationDocumentSchema,
   rejectVerificationSchema,
+  requestCenterDocumentsSchema,
   requestDocumentsSchema,
   requestOtpSchema,
   resendOtpSchema,
@@ -40,23 +47,36 @@ import {
 } from "./services/dashboard.service";
 import {
   addAdminIncidentNote,
+  approveCaregiverVerification,
+  approveCenterVerification,
   approveProviderVerification,
+  approveVerificationDocument,
   getAdminBookingById,
   getAdminBookingHistory,
+  getAdminCaregiverVerificationById,
   getAdminCenterById,
+  getAdminCenterVerificationById,
   getAdminIncidentById,
   getAdminPlatformSettings,
   getAdminProviderById,
   getAdminReportsData,
   getAdminUserById,
+  getAdminVerificationDocumentById,
   listAdminAuditLogs,
   listAdminBookings,
+  listAdminCaregiverVerifications,
   listAdminCenters,
+  listAdminCenterVerifications,
   listAdminIncidents,
   listAdminProviders,
   listAdminUsers,
+  listAdminVerificationDocuments,
   listAdminVerifications,
+  rejectCaregiverVerification,
+  rejectCenterVerification,
   rejectProviderVerification,
+  rejectVerificationDocument,
+  requestCenterDocuments,
   requestProviderDocuments,
   transitionAdminBookingStatus,
   updateAdminCenterStatus,
@@ -658,6 +678,275 @@ export async function dispatchAdminApiRequest(
         body: {
           success: true,
           message: "Additional verification documents requested.",
+          data: result,
+        },
+      };
+    }
+
+    // ==========================================
+    // 4b. Centre Verification Endpoints (`providers:read` / `providers:verify`)
+    // ==========================================
+
+    if (routeKey === "GET /center-verifications") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const items = await listAdminCenterVerifications({
+        status: req.query.status,
+        search: req.query.search,
+      });
+      return { status: 200, body: { success: true, data: items } };
+    }
+
+    if (
+      method === "GET" &&
+      req.segments[0] === "center-verifications" &&
+      req.segments.length === 2
+    ) {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const item = await getAdminCenterVerificationById(req.segments[1]);
+      return { status: 200, body: { success: true, data: item } };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "center-verifications" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "approve"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = approveCenterVerificationSchema.parse(req.body);
+      const result = await approveCenterVerification({
+        idOrCenterId: req.segments[1],
+        reviewComments: parsed.reviewComments,
+        checklistState: parsed.checklistState,
+        safetyComplianceNotes: parsed.safetyComplianceNotes,
+        activateListing: parsed.activateListing,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: "Daycare centre verification approved and listing activated.",
+          data: result,
+        },
+      };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "center-verifications" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "reject"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = rejectCenterVerificationSchema.parse(req.body);
+      const result = await rejectCenterVerification({
+        idOrCenterId: req.segments[1],
+        rejectionReason: parsed.rejectionReason,
+        reviewComments: parsed.reviewComments,
+        suspendCenter: parsed.suspendCenter,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: parsed.suspendCenter
+            ? "Daycare centre verification suspended."
+            : "Daycare centre verification rejected.",
+          data: result,
+        },
+      };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "center-verifications" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "request-documents"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = requestCenterDocumentsSchema.parse(req.body);
+      const result = await requestCenterDocuments({
+        idOrCenterId: req.segments[1],
+        requestedDocuments: parsed.requestedDocuments,
+        reviewComments: parsed.reviewComments,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: "Additional daycare centre verification documents requested.",
+          data: result,
+        },
+      };
+    }
+
+    // ==========================================
+    // 4c. Caregiver Verification Endpoints (`providers:read` / `providers:verify`)
+    // ==========================================
+
+    if (routeKey === "GET /caregiver-verifications") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const items = await listAdminCaregiverVerifications({
+        status: req.query.status,
+        search: req.query.search,
+        centerId: req.query.centerId,
+      });
+      return { status: 200, body: { success: true, data: items } };
+    }
+
+    if (
+      method === "GET" &&
+      req.segments[0] === "caregiver-verifications" &&
+      req.segments.length === 2
+    ) {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const item = await getAdminCaregiverVerificationById(req.segments[1]);
+      return { status: 200, body: { success: true, data: item } };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "caregiver-verifications" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "approve"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = approveCaregiverVerificationSchema.parse(req.body);
+      const result = await approveCaregiverVerification({
+        idOrCaregiverId: req.segments[1],
+        reviewComments: parsed.reviewComments,
+        expiresAt: parsed.expiresAt,
+        checklistState: parsed.checklistState,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: "Caregiver verification approved.",
+          data: result,
+        },
+      };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "caregiver-verifications" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "reject"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = rejectCaregiverVerificationSchema.parse(req.body);
+      const result = await rejectCaregiverVerification({
+        idOrCaregiverId: req.segments[1],
+        rejectionReason: parsed.rejectionReason,
+        reviewComments: parsed.reviewComments,
+        suspendCaregiver: parsed.suspendCaregiver,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: parsed.suspendCaregiver
+            ? "Caregiver verification suspended."
+            : "Caregiver verification rejected.",
+          data: result,
+        },
+      };
+    }
+
+    // ==========================================
+    // 4d. Verification Document Endpoints (`providers:read` / `providers:verify`)
+    // ==========================================
+
+    if (routeKey === "GET /verification-documents") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const items = await listAdminVerificationDocuments({
+        status: req.query.status,
+        providerId: req.query.providerId,
+        centerId: req.query.centerId,
+        caregiverId: req.query.caregiverId,
+        search: req.query.search,
+      });
+      return { status: 200, body: { success: true, data: items } };
+    }
+
+    if (
+      method === "GET" &&
+      req.segments[0] === "verification-documents" &&
+      req.segments.length === 2
+    ) {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      const item = await getAdminVerificationDocumentById(req.segments[1]);
+      return { status: 200, body: { success: true, data: item } };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "verification-documents" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "approve"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = approveVerificationDocumentSchema.parse(req.body ?? {});
+      const result = await approveVerificationDocument({
+        documentId: req.segments[1],
+        reviewNotes:
+          parsed.reviewNotes ||
+          parsed.reviewComments ||
+          "Verified document authenticity and compliance.",
+        expiresAt: parsed.expiresAt,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: "Verification document approved.",
+          data: result,
+        },
+      };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "verification-documents" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "reject"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const parsed = rejectVerificationDocumentSchema.parse(req.body);
+      const result = await rejectVerificationDocument({
+        documentId: req.segments[1],
+        rejectionReason: parsed.rejectionReason,
+        reviewNotes: parsed.reviewNotes || parsed.reviewComments,
+        requestReplacement:
+          parsed.requestReplacement ?? parsed.replacementRequested,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: "Verification document rejected.",
           data: result,
         },
       };

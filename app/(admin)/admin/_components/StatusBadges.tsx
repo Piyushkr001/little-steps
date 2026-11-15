@@ -27,6 +27,8 @@ export function StatusPill({ status }: { status: string }) {
       "INVESTIGATING",
       "CHECKED_IN",
       "PENDING_APPROVAL",
+      "NOT_VERIFIED",
+      "UNPAID",
       "SUBMITTED",
       "MEDIUM",
       "OPEN",
