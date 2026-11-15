@@ -30,6 +30,10 @@ export default function Navbar() {
     const pathname = usePathname();
     const [menuOpen, setMenuOpen] = useState(false);
 
+    if (pathname?.startsWith("/admin")) {
+        return null;
+    }
+
     const isActive = (href: string) =>
         href === "/"
             ? pathname === "/"
@@ -50,7 +54,7 @@ export default function Navbar() {
                         alt="Little Steps - Trusted 24×7 Childcare"
                         width={220}
                         height={52}
-                        priority
+                        preload
                         className="h-auto w-43.75 object-contain sm:w-51.25 xl:w-55"
                     />
                 </Link>

@@ -1,6 +1,6 @@
-
 import Image from "next/image";
 import Link from "next/link";
+import { cacheLife } from "next/cache";
 import {
   ArrowRight,
   ArrowUpRight,
@@ -94,7 +94,10 @@ function FooterLink({
   );
 }
 
-export default function Footer() {
+export default async function Footer() {
+  "use cache";
+  cacheLife("days");
+
   const currentYear = new Date().getFullYear();
 
   return (
@@ -130,7 +133,7 @@ export default function Footer() {
               className={buttonVariants({
                 size: "lg",
                 className:
-                  "h-12 gap-2 rounded-full bg-white px-6 font-semibold text-[#087F78] shadow-sm hover:bg-[#EAF8F5] hover:text-[#066B65]",
+                  "h-12 gap-2 rounded-full px-6 font-semibold text-[#087F78] shadow-sm hover:bg-[#EAF8F5] hover:text-[#066B65]",
               })}
             >
               Find Childcare
@@ -276,14 +279,6 @@ export default function Footer() {
                 >
                   <Mail size={16} className="shrink-0 text-[#087F78]" />
                   Contact Support
-                </Link>
-
-                <Link
-                  href="/centers"
-                  className="flex items-center gap-2 text-sm text-slate-600 transition-colors hover:text-[#087F78] dark:text-slate-400 dark:hover:text-teal-300"
-                >
-                  <MapPin size={16} className="shrink-0 text-[#087F78]" />
-                  Explore Locations
                 </Link>
               </div>
             </div>
