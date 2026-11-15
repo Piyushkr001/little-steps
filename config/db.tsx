@@ -1,18 +1,27 @@
 import { neon } from "@neondatabase/serverless";
-import { drizzle } from "drizzle-orm/neon-http";
+import { drizzle, type NeonHttpDatabase } from "drizzle-orm/neon-http";
 import * as schema from "./schema";
 
-const connectionString =
-  process.env.TEST_DATABASE_URL ||
-  process.env.DATABASE_URL ||
-  "postgresql://postgres:postgres@localhost:5432/littlesteps";
+export type AppDatabase = NeonHttpDatabase<Record<string, never>>;
 
-export const sqlClient = neon(connectionString);
-const defaultDb = drizzle({ client: sqlClient });
-
-export type AppDatabase = typeof defaultDb;
-
+let cachedDefaultDb: AppDatabase | null = null;
+let cachedConnectionString: string | null = null;
 let testDbOverride: AppDatabase | null = null;
+
+function getDefaultDb(): AppDatabase {
+  const connectionString =
+    process.env.TEST_DATABASE_URL ||
+    process.env.DATABASE_URL ||
+    "postgresql://postgres:postgres@localhost:5432/littlesteps";
+
+  if (!cachedDefaultDb || cachedConnectionString !== connectionString) {
+    const sqlClient = neon(connectionString);
+    cachedDefaultDb = drizzle({ client: sqlClient });
+    cachedConnectionString = connectionString;
+  }
+
+  return cachedDefaultDb;
+}
 
 /**
  * Allows isolated automated tests to inject a separate test database adapter
@@ -25,9 +34,9 @@ export function setDatabaseInstanceForTests(override: AppDatabase | null): void 
   testDbOverride = override;
 }
 
-export const db: AppDatabase = new Proxy(defaultDb, {
-  get(target, prop, receiver) {
-    const active = testDbOverride ?? target;
+export const db: AppDatabase = new Proxy({} as AppDatabase, {
+  get(_target, prop, receiver) {
+    const active = testDbOverride ?? getDefaultDb();
     const value = Reflect.get(active, prop, receiver);
     return typeof value === "function" ? value.bind(active) : value;
   },
