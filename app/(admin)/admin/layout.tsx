@@ -1,15 +1,19 @@
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
+import { connection } from "next/server";
 import { Suspense } from "react";
 import { ADMIN_SESSION_COOKIE_NAME } from "@/server/security/crypto";
 import { validateAdminSessionToken } from "@/server/services/admin-auth.service";
 import { AdminPortalShell } from "./_components/AdminPortalShell";
+
+export const instant = false;
 
 async function AuthenticatedAdminGate({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  await connection();
   const cookieStore = await cookies();
   const rawSession = cookieStore.get(ADMIN_SESSION_COOKIE_NAME)?.value;
   const admin = await validateAdminSessionToken(rawSession);
