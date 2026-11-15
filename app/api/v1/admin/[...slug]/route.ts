@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { dispatchAdminApiRequest } from "@/server/dispatcher";
+import { extractTrustedClientIp } from "@/server/middleware/rate-limit";
 
 async function handleRequest(
   request: NextRequest,
@@ -31,10 +32,7 @@ async function handleRequest(
     headers[key.toLowerCase()] = value;
   });
 
-  const ipAddress =
-    request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    request.headers.get("x-real-ip") ||
-    "127.0.0.1";
+  const ipAddress = extractTrustedClientIp(headers, "127.0.0.1");
   const userAgent = request.headers.get("user-agent") || "NextClient";
 
   const result = await dispatchAdminApiRequest({

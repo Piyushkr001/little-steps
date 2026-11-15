@@ -2,6 +2,21 @@ export type AdminRole = "ADMIN" | "SUPER_ADMIN";
 export type UserRole = "PARENT" | "PROVIDER" | "CAREGIVER" | "ADMIN" | "SUPER_ADMIN";
 export type AccountStatus = "ACTIVE" | "SUSPENDED" | "DISABLED" | "PENDING";
 
+export type AdminPermission =
+  | "dashboard:read"
+  | "users:read"
+  | "users:manage"
+  | "providers:read"
+  | "providers:verify"
+  | "centers:manage"
+  | "bookings:read"
+  | "bookings:manage"
+  | "incidents:read"
+  | "incidents:manage"
+  | "reports:read"
+  | "audit:read"
+  | "settings:manage";
+
 export type VerificationStatus =
   | "NOT_SUBMITTED"
   | "PENDING"

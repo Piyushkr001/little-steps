@@ -1,5 +1,5 @@
-import { eq, sql } from "drizzle-orm";
-import { db } from "@/config/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { db } from "../../config/db";
 import {
   adminAuditLogs,
   adminProfiles,
@@ -19,12 +19,232 @@ import {
   userRoles,
   users,
   verificationDocuments,
-} from "@/config/schema";
+} from "../../config/schema";
+import type { AdminPermission, AdminRole } from "../../lib/admin/types";
+import { hasAdminEmailKeyword } from "../../lib/admin/validation";
 import { computeAuditIntegrityHash } from "../security/crypto";
+import {
+  DEFAULT_STANDARD_ADMIN_PERMISSIONS,
+  resolveEffectiveAdminPermissions,
+} from "../security/permissions";
+import { recordAdminAuditLog } from "./audit.service";
+
+export const KNOWN_DEMO_SEED_EMAILS = [
+  "superadmin@littlesteps.com",
+  "admin@littlesteps.com",
+  "littlesteps.admin@gmail.com",
+  "suspended.admin@littlesteps.com",
+  "parent.admin@example.com",
+] as const;
+
+export interface ProvisionAdminInput {
+  email: string;
+  name: string;
+  role: AdminRole;
+  department: string;
+  title: string;
+  permissions?: AdminPermission[];
+  provisionedByAdminId: string;
+  provisionedByAdminEmail: string;
+  ipAddress?: string;
+}
+
+/**
+ * Explicit privileged procedure for provisioning an authorized administrator account.
+ * Never invoked automatically during user registration or public authentication.
+ */
+export async function provisionAuthorizedAdministrator(
+  input: ProvisionAdminInput
+) {
+  const normalizedEmail = input.email.trim().toLowerCase();
+
+  if (!hasAdminEmailKeyword(normalizedEmail)) {
+    throw new Error(
+      "Admin provisioning rejected: Administrator email must contain the 'admin' keyword."
+    );
+  }
+
+  if (input.role !== "ADMIN" && input.role !== "SUPER_ADMIN") {
+    throw new Error(
+      "Admin provisioning rejected: Role must be ADMIN or SUPER_ADMIN."
+    );
+  }
+
+  const [actor] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, input.provisionedByAdminId))
+    .limit(1);
+
+  if (!actor || actor.role !== "SUPER_ADMIN" || actor.status !== "ACTIVE") {
+    throw new Error(
+      "Admin provisioning rejected: Only an active SUPER_ADMIN may provision administrator accounts."
+    );
+  }
+
+  const effectivePermissions = resolveEffectiveAdminPermissions(
+    input.role,
+    input.permissions ?? DEFAULT_STANDARD_ADMIN_PERMISSIONS
+  );
+
+  const now = new Date();
+  const [existingUser] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, normalizedEmail))
+    .limit(1);
+
+  let targetUser = existingUser;
+  if (!targetUser) {
+    const [created] = await db
+      .insert(users)
+      .values({
+        email: normalizedEmail,
+        name: input.name.trim(),
+        role: input.role,
+        status: "ACTIVE",
+        emailVerified: true,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .returning();
+    targetUser = created;
+  } else {
+    const [updated] = await db
+      .update(users)
+      .set({
+        name: input.name.trim(),
+        role: input.role,
+        status: "ACTIVE",
+        updatedAt: now,
+      })
+      .where(eq(users.id, targetUser.id))
+      .returning();
+    targetUser = updated;
+  }
+
+  const existingRoleAssignment = await db
+    .select()
+    .from(userRoles)
+    .where(
+      and(
+        eq(userRoles.userId, targetUser.id),
+        eq(userRoles.role, input.role)
+      )
+    )
+    .limit(1);
+
+  if (existingRoleAssignment.length === 0) {
+    await db.insert(userRoles).values({
+      userId: targetUser.id,
+      role: input.role,
+      assignedBy: actor.id,
+      isActive: true,
+      createdAt: now,
+    });
+  } else {
+    await db
+      .update(userRoles)
+      .set({ isActive: true, assignedBy: actor.id })
+      .where(eq(userRoles.id, existingRoleAssignment[0].id));
+  }
+
+  const [existingProfile] = await db
+    .select()
+    .from(adminProfiles)
+    .where(eq(adminProfiles.userId, targetUser.id))
+    .limit(1);
+
+  if (!existingProfile) {
+    await db.insert(adminProfiles).values({
+      userId: targetUser.id,
+      department: input.department.trim(),
+      title: input.title.trim(),
+      isApproved: true,
+      permissions: effectivePermissions,
+      provisionedBy: actor.id,
+      createdAt: now,
+      updatedAt: now,
+    });
+  } else {
+    await db
+      .update(adminProfiles)
+      .set({
+        department: input.department.trim(),
+        title: input.title.trim(),
+        isApproved: true,
+        permissions: effectivePermissions,
+        provisionedBy: actor.id,
+        updatedAt: now,
+      })
+      .where(eq(adminProfiles.id, existingProfile.id));
+  }
+
+  await recordAdminAuditLog({
+    adminUserId: actor.id,
+    adminEmail: actor.email,
+    action: "ADMIN_ACCOUNT_PROVISIONED",
+    entityType: "ADMIN_PROFILE",
+    entityId: targetUser.id,
+    summary: `Provisioned ${input.role} administrator account for ${normalizedEmail}`,
+    outcome: "SUCCESS",
+    newState: {
+      email: normalizedEmail,
+      role: input.role,
+      department: input.department,
+      permissions: effectivePermissions,
+    },
+    ipAddress: input.ipAddress,
+  });
+
+  return {
+    userId: targetUser.id,
+    email: targetUser.email,
+    role: targetUser.role,
+    permissions: effectivePermissions,
+  };
+}
+
+/**
+ * Non-destructive inspection utility that identifies accounts originally created
+ * by the legacy demo seeder so security personnel can review them without
+ * deleting or altering database records.
+ */
+export async function identifyDemoSeededAdminRecords() {
+  const matchedUsers = await db
+    .select({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      role: users.role,
+      status: users.status,
+      createdAt: users.createdAt,
+    })
+    .from(users)
+    .where(inArray(users.email, [...KNOWN_DEMO_SEED_EMAILS]));
+
+  return matchedUsers;
+}
 
 let isSeededInProcess = false;
 
-export async function ensureAdminPortalSeeded(): Promise<void> {
+/**
+ * Explicit development-only database seeding utility.
+ * Disabled during normal application requests and strictly blocked in production.
+ */
+export async function runExplicitDevelopmentSeed(): Promise<void> {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "Refusing to execute development seed against a production environment."
+    );
+  }
+
+  if (process.env.ALLOW_EXPLICIT_DEV_SEED !== "true") {
+    throw new Error(
+      "Development seeding is disabled by default. Set ALLOW_EXPLICIT_DEV_SEED=true to run explicitly against an isolated development database."
+    );
+  }
+
   if (isSeededInProcess) return;
 
   try {

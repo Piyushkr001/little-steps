@@ -1,5 +1,6 @@
 import express, { type Request, type Response } from "express";
 import { dispatchAdminApiRequest } from "./dispatcher";
+import { extractTrustedClientIp } from "./middleware/rate-limit";
 
 function parseCookieHeader(cookieHeader?: string): Record<string, string> {
   if (!cookieHeader) return {};
@@ -43,10 +44,7 @@ export function createExpressApp() {
       body: req.body,
       cookies: parseCookieHeader(req.headers.cookie),
       headers,
-      ipAddress:
-        (req.headers["x-forwarded-for"] as string)?.split(",")[0]?.trim() ||
-        req.ip ||
-        "127.0.0.1",
+      ipAddress: extractTrustedClientIp(headers, req.ip || "127.0.0.1"),
       userAgent: req.headers["user-agent"] || "ExpressClient",
     });
 

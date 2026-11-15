@@ -1,5 +1,5 @@
 import { desc, inArray } from "drizzle-orm";
-import { db } from "@/config/db";
+import { db } from "../../config/db";
 import {
   adminAuditLogs,
   bookings,
@@ -10,17 +10,14 @@ import {
   safetyIncidents,
   users,
   verificationDocuments,
-} from "@/config/schema";
+} from "../../config/schema";
 import type {
   DashboardActivity,
   DashboardAnalytics,
   DashboardStats,
-} from "@/lib/admin/types";
-import { ensureAdminPortalSeeded } from "./seed.service";
+} from "../../lib/admin/types";
 
 export async function getAdminDashboardStats(): Promise<DashboardStats> {
-  await ensureAdminPortalSeeded();
-
   const [
     allUsers,
     allProviders,
@@ -77,7 +74,6 @@ export async function getAdminDashboardStats(): Promise<DashboardStats> {
 }
 
 export async function getAdminDashboardAnalytics(): Promise<DashboardAnalytics> {
-  await ensureAdminPortalSeeded();
 
   const [allUsers, allProviders, allCenters, allBookings] = await Promise.all([
     db.select().from(users),
@@ -201,7 +197,6 @@ export async function getAdminDashboardActivity(): Promise<
     }>;
   }
 > {
-  await ensureAdminPortalSeeded();
 
   const [
     recentProvidersRows,

@@ -1,5 +1,5 @@
 import { ZodError } from "zod";
-import type { AuthenticatedAdmin } from "@/lib/admin/types";
+import type { AdminPermission, AuthenticatedAdmin } from "../lib/admin/types";
 import {
   addIncidentNoteSchema,
   approveVerificationSchema,
@@ -13,15 +13,18 @@ import {
   updatePlatformSettingsSchema,
   updateUserStatusSchema,
   verifyOtpSchema,
-} from "@/lib/admin/validation";
+} from "../lib/admin/validation";
+import { AdminMailDeliveryError } from "./mail/nodemailer";
 import { checkRateLimit } from "./middleware/rate-limit";
 import {
   ADMIN_CSRF_COOKIE_NAME,
   ADMIN_CSRF_HEADER_NAME,
   ADMIN_SESSION_COOKIE_NAME,
   ADMIN_SESSION_TTL_HOURS,
+  AdminCryptoSecretError,
   verifyCsrfToken,
 } from "./security/crypto";
+import { hasAdminPermission } from "./security/permissions";
 import {
   AdminAuthError,
   issueAdminOtpChallenge,
@@ -29,6 +32,7 @@ import {
   validateAdminSessionToken,
   verifyAdminOtpAndCreateSession,
 } from "./services/admin-auth.service";
+import { recordAdminAuditLog } from "./services/audit.service";
 import {
   getAdminDashboardActivity,
   getAdminDashboardAnalytics,
@@ -111,7 +115,7 @@ function buildAuthCookies(
       value: csrfToken,
       httpOnly: false,
       secure: isProd,
-      sameSite: "lax",
+      sameSite: "strict",
       path: "/",
       maxAge,
     },
@@ -135,11 +139,60 @@ function buildClearAuthCookies(): CookieInstruction[] {
       value: "",
       httpOnly: false,
       secure: isProd,
-      sameSite: "lax",
+      sameSite: "strict",
       path: "/",
       maxAge: 0,
     },
   ];
+}
+
+function validateMutatingRequestOrigin(req: UnifiedApiRequest): void {
+  const originHeader = req.headers["origin"];
+  const refererHeader = req.headers["referer"];
+  const hostHeader = req.headers["x-forwarded-host"] || req.headers["host"];
+
+  if (!originHeader && !refererHeader) {
+    return;
+  }
+
+  const allowedHosts = new Set<string>();
+  if (hostHeader) {
+    allowedHosts.add(hostHeader.split(",")[0]!.trim().toLowerCase());
+  }
+
+  const configuredAppUrl = process.env.NEXT_PUBLIC_APP_URL;
+  if (configuredAppUrl) {
+    try {
+      allowedHosts.add(new URL(configuredAppUrl).host.toLowerCase());
+    } catch {
+      // Ignore malformed NEXT_PUBLIC_APP_URL
+    }
+  }
+
+  if (allowedHosts.size === 0) {
+    return;
+  }
+
+  const candidateUrl = originHeader || refererHeader;
+  if (candidateUrl) {
+    try {
+      const parsedHost = new URL(candidateUrl).host.toLowerCase();
+      if (!allowedHosts.has(parsedHost)) {
+        throw new AdminAuthError(
+          "CSRF_ORIGIN_MISMATCH",
+          "Cross-origin administrative mutation request rejected.",
+          403
+        );
+      }
+    } catch (err) {
+      if (err instanceof AdminAuthError) throw err;
+      throw new AdminAuthError(
+        "CSRF_ORIGIN_MISMATCH",
+        "Invalid request origin header.",
+        403
+      );
+    }
+  }
 }
 
 async function requireAuthenticatedAdmin(
@@ -162,10 +215,31 @@ async function requireAuthenticatedAdmin(
   );
 
   if (enforceCsrfForMutating && isMutating) {
+    validateMutatingRequestOrigin(req);
+
     const headerCsrf =
       req.headers[ADMIN_CSRF_HEADER_NAME] ||
       req.headers[ADMIN_CSRF_HEADER_NAME.toUpperCase()];
-    if (!headerCsrf || !verifyCsrfToken(headerCsrf, admin.csrfToken)) {
+    const cookieCsrf = req.cookies[ADMIN_CSRF_COOKIE_NAME];
+
+    const matchesSessionCsrf =
+      Boolean(headerCsrf) && verifyCsrfToken(headerCsrf!, admin.csrfToken);
+    const matchesCookieCsrf =
+      !cookieCsrf || (Boolean(headerCsrf) && verifyCsrfToken(headerCsrf!, cookieCsrf));
+
+    if (!matchesSessionCsrf || !matchesCookieCsrf) {
+      await recordAdminAuditLog({
+        adminUserId: admin.id,
+        adminEmail: admin.email,
+        action: "ADMIN_CSRF_VALIDATION_FAILED",
+        entityType: "ADMIN_SESSION",
+        entityId: admin.sessionId,
+        summary: `Rejected mutating request (${req.method.toUpperCase()} /${req.segments.join("/")}) due to invalid or missing CSRF token`,
+        outcome: "DENIED",
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+
       throw new AdminAuthError(
         "CSRF_VALIDATION_FAILED",
         "Invalid or missing CSRF security token.",
@@ -175,6 +249,57 @@ async function requireAuthenticatedAdmin(
   }
 
   return admin;
+}
+
+/**
+ * Centralized server-side permission guard.
+ * Kept strictly separate from session authentication (`requireAuthenticatedAdmin`).
+ */
+async function requireAdminPermission(
+  admin: AuthenticatedAdmin,
+  requiredPermission: AdminPermission,
+  req: UnifiedApiRequest,
+  routeKey: string
+): Promise<void> {
+  if (hasAdminPermission(admin, requiredPermission)) {
+    return;
+  }
+
+  await recordAdminAuditLog({
+    adminUserId: admin.id,
+    adminEmail: admin.email,
+    action: "UNAUTHORIZED_ADMIN_ACCESS_ATTEMPT",
+    entityType: "ADMIN_PERMISSION",
+    entityId: admin.id,
+    summary: `Denied ${admin.email} (${admin.role}) access to ${routeKey}: missing required permission '${requiredPermission}'`,
+    outcome: "DENIED",
+    newState: {
+      routeKey,
+      requiredPermission,
+      role: admin.role,
+    },
+    ipAddress: req.ipAddress,
+    userAgent: req.userAgent,
+  });
+
+  throw new AdminAuthError(
+    "INSUFFICIENT_ADMIN_PERMISSIONS",
+    `Access denied. Required permission '${requiredPermission}' is not granted to your administrator profile.`,
+    403
+  );
+}
+
+function sanitizeErrorForServerLog(error: unknown): Record<string, unknown> {
+  if (error instanceof Error) {
+    const redactedMessage = error.message
+      .replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, "[REDACTED_DB_URI]")
+      .replace(/\b[0-9a-fA-F]{48,}\b/g, "[REDACTED_HEX_TOKEN]");
+    return {
+      name: error.name,
+      message: redactedMessage,
+    };
+  }
+  return { name: "UnknownError" };
 }
 
 export async function dispatchAdminApiRequest(
@@ -190,16 +315,10 @@ export async function dispatchAdminApiRequest(
 
     if (routeKey === "POST /auth/request-otp") {
       const parsed = requestOtpSchema.parse(req.body);
-      const ipLimit = checkRateLimit(
-        `otp-req:ip:${req.ipAddress}`,
-        10,
-        10 * 60_000
-      );
-      const acctLimit = checkRateLimit(
-        `otp-req:acct:${parsed.email}`,
-        5,
-        10 * 60_000
-      );
+      const [ipLimit, acctLimit] = await Promise.all([
+        checkRateLimit(`otp-req-ip:${req.ipAddress}`, 10, 10 * 60_000),
+        checkRateLimit(`otp-req-acct:${parsed.email}`, 5, 10 * 60_000),
+      ]);
 
       if (!ipLimit.allowed || !acctLimit.allowed) {
         return {
@@ -235,13 +354,12 @@ export async function dispatchAdminApiRequest(
 
     if (routeKey === "POST /auth/resend-otp") {
       const parsed = resendOtpSchema.parse(req.body);
-      const acctLimit = checkRateLimit(
-        `otp-resend:acct:${parsed.email}`,
-        5,
-        10 * 60_000
-      );
+      const [ipLimit, acctLimit] = await Promise.all([
+        checkRateLimit(`otp-resend-ip:${req.ipAddress}`, 10, 10 * 60_000),
+        checkRateLimit(`otp-resend-acct:${parsed.email}`, 5, 10 * 60_000),
+      ]);
 
-      if (!acctLimit.allowed) {
+      if (!ipLimit.allowed || !acctLimit.allowed) {
         return {
           status: 429,
           body: {
@@ -275,13 +393,12 @@ export async function dispatchAdminApiRequest(
 
     if (routeKey === "POST /auth/verify-otp") {
       const parsed = verifyOtpSchema.parse(req.body);
-      const ipLimit = checkRateLimit(
-        `otp-verify:ip:${req.ipAddress}`,
-        15,
-        10 * 60_000
-      );
+      const [ipLimit, acctLimit] = await Promise.all([
+        checkRateLimit(`otp-verify-ip:${req.ipAddress}`, 15, 10 * 60_000),
+        checkRateLimit(`otp-verify-acct:${parsed.email}`, 10, 10 * 60_000),
+      ]);
 
-      if (!ipLimit.allowed) {
+      if (!ipLimit.allowed || !acctLimit.allowed) {
         return {
           status: 429,
           body: {
@@ -289,7 +406,7 @@ export async function dispatchAdminApiRequest(
             error: {
               code: "RATE_LIMIT_EXCEEDED",
               message:
-                "Too many verification attempts from this IP. Please try again later.",
+                "Too many verification attempts. Please try again later.",
             },
           },
         };
@@ -322,6 +439,7 @@ export async function dispatchAdminApiRequest(
       const rawToken = req.cookies[ADMIN_SESSION_COOKIE_NAME];
       await revokeAdminSession({
         rawSessionToken: rawToken,
+        reason: "ADMIN_LOGOUT",
         ipAddress: req.ipAddress,
         userAgent: req.userAgent,
       });
@@ -352,29 +470,33 @@ export async function dispatchAdminApiRequest(
     const admin = await requireAuthenticatedAdmin(req, true);
 
     // ==========================================
-    // 2. Dashboard Endpoints
+    // 2. Dashboard Endpoints (`dashboard:read`)
     // ==========================================
 
     if (routeKey === "GET /dashboard/stats") {
+      await requireAdminPermission(admin, "dashboard:read", req, routeKey);
       const stats = await getAdminDashboardStats();
       return { status: 200, body: { success: true, data: stats } };
     }
 
     if (routeKey === "GET /dashboard/analytics") {
+      await requireAdminPermission(admin, "dashboard:read", req, routeKey);
       const analytics = await getAdminDashboardAnalytics();
       return { status: 200, body: { success: true, data: analytics } };
     }
 
     if (routeKey === "GET /dashboard/activity") {
+      await requireAdminPermission(admin, "dashboard:read", req, routeKey);
       const activity = await getAdminDashboardActivity();
       return { status: 200, body: { success: true, data: activity } };
     }
 
     // ==========================================
-    // 3. User Management Endpoints
+    // 3. User Management Endpoints (`users:read` / `users:manage`)
     // ==========================================
 
     if (routeKey === "GET /users") {
+      await requireAdminPermission(admin, "users:read", req, routeKey);
       const result = await listAdminUsers({
         search: req.query.search,
         role: req.query.role,
@@ -397,6 +519,7 @@ export async function dispatchAdminApiRequest(
       req.segments[0] === "users" &&
       req.segments.length === 2
     ) {
+      await requireAdminPermission(admin, "users:read", req, routeKey);
       const user = await getAdminUserById(req.segments[1]);
       return { status: 200, body: { success: true, data: user } };
     }
@@ -407,6 +530,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "status"
     ) {
+      await requireAdminPermission(admin, "users:manage", req, routeKey);
       const parsed = updateUserStatusSchema.parse(req.body);
       const updated = await updateAdminUserStatus({
         userId: req.segments[1],
@@ -427,10 +551,11 @@ export async function dispatchAdminApiRequest(
     }
 
     // ==========================================
-    // 4. Provider & Verification Endpoints
+    // 4. Provider & Verification Endpoints (`providers:read` / `providers:verify`)
     // ==========================================
 
     if (routeKey === "GET /providers") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
       const items = await listAdminProviders({
         search: req.query.search,
         verificationStatus: req.query.status,
@@ -443,11 +568,13 @@ export async function dispatchAdminApiRequest(
       req.segments[0] === "providers" &&
       req.segments.length === 2
     ) {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
       const provider = await getAdminProviderById(req.segments[1]);
       return { status: 200, body: { success: true, data: provider } };
     }
 
     if (routeKey === "GET /verifications") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
       const items = await listAdminVerifications({
         status: req.query.status,
         search: req.query.search,
@@ -461,6 +588,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "approve"
     ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
       const parsed = approveVerificationSchema.parse(req.body);
       const result = await approveProviderVerification({
         verificationId: req.segments[1],
@@ -486,6 +614,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "reject"
     ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
       const parsed = rejectVerificationSchema.parse(req.body);
       const result = await rejectProviderVerification({
         verificationId: req.segments[1],
@@ -514,6 +643,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "request-documents"
     ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
       const parsed = requestDocumentsSchema.parse(req.body);
       const result = await requestProviderDocuments({
         verificationId: req.segments[1],
@@ -534,10 +664,11 @@ export async function dispatchAdminApiRequest(
     }
 
     // ==========================================
-    // 5. Daycare Centre Endpoints
+    // 5. Daycare Centre Endpoints (`providers:read` / `centers:manage`)
     // ==========================================
 
     if (routeKey === "GET /centers") {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
       const items = await listAdminCenters({
         search: req.query.search,
         listingStatus: req.query.listingStatus,
@@ -552,6 +683,7 @@ export async function dispatchAdminApiRequest(
       req.segments[0] === "centers" &&
       req.segments.length === 2
     ) {
+      await requireAdminPermission(admin, "providers:read", req, routeKey);
       const center = await getAdminCenterById(req.segments[1]);
       return { status: 200, body: { success: true, data: center } };
     }
@@ -562,6 +694,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "status"
     ) {
+      await requireAdminPermission(admin, "centers:manage", req, routeKey);
       const parsed = updateCenterStatusSchema.parse(req.body);
       const updated = await updateAdminCenterStatus({
         centerId: req.segments[1],
@@ -582,10 +715,11 @@ export async function dispatchAdminApiRequest(
     }
 
     // ==========================================
-    // 6. Booking Oversight Endpoints
+    // 6. Booking Oversight Endpoints (`bookings:read` / `bookings:manage`)
     // ==========================================
 
     if (routeKey === "GET /bookings") {
+      await requireAdminPermission(admin, "bookings:read", req, routeKey);
       const items = await listAdminBookings({
         search: req.query.search,
         status: req.query.status,
@@ -600,6 +734,7 @@ export async function dispatchAdminApiRequest(
       req.segments[0] === "bookings" &&
       req.segments.length === 2
     ) {
+      await requireAdminPermission(admin, "bookings:read", req, routeKey);
       const booking = await getAdminBookingById(req.segments[1]);
       return { status: 200, body: { success: true, data: booking } };
     }
@@ -610,6 +745,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "history"
     ) {
+      await requireAdminPermission(admin, "bookings:read", req, routeKey);
       const history = await getAdminBookingHistory(req.segments[1]);
       return { status: 200, body: { success: true, data: history } };
     }
@@ -620,6 +756,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "status"
     ) {
+      await requireAdminPermission(admin, "bookings:manage", req, routeKey);
       const parsed = updateBookingStatusSchema.parse(req.body);
       const updated = await transitionAdminBookingStatus({
         bookingId: req.segments[1],
@@ -640,10 +777,11 @@ export async function dispatchAdminApiRequest(
     }
 
     // ==========================================
-    // 7. Safety Incidents Endpoints
+    // 7. Safety Incidents Endpoints (`incidents:read` / `incidents:manage`)
     // ==========================================
 
     if (routeKey === "GET /incidents") {
+      await requireAdminPermission(admin, "incidents:read", req, routeKey);
       const items = await listAdminIncidents({
         status: req.query.status,
         severity: req.query.severity,
@@ -658,6 +796,7 @@ export async function dispatchAdminApiRequest(
       req.segments[0] === "incidents" &&
       req.segments.length === 2
     ) {
+      await requireAdminPermission(admin, "incidents:read", req, routeKey);
       const incident = await getAdminIncidentById(req.segments[1]);
       return { status: 200, body: { success: true, data: incident } };
     }
@@ -668,6 +807,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "status"
     ) {
+      await requireAdminPermission(admin, "incidents:manage", req, routeKey);
       const parsed = updateIncidentStatusSchema.parse(req.body);
       const updated = await updateAdminIncidentStatus({
         incidentId: req.segments[1],
@@ -695,6 +835,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "notes"
     ) {
+      await requireAdminPermission(admin, "incidents:manage", req, routeKey);
       const parsed = addIncidentNoteSchema.parse(req.body);
       const updated = await addAdminIncidentNote({
         incidentId: req.segments[1],
@@ -719,11 +860,13 @@ export async function dispatchAdminApiRequest(
     // ==========================================
 
     if (routeKey === "GET /reports") {
+      await requireAdminPermission(admin, "reports:read", req, routeKey);
       const reports = await getAdminReportsData();
       return { status: 200, body: { success: true, data: reports } };
     }
 
     if (routeKey === "GET /audit-logs") {
+      await requireAdminPermission(admin, "audit:read", req, routeKey);
       const logs = await listAdminAuditLogs({
         action: req.query.action,
         entityType: req.query.entityType,
@@ -734,11 +877,13 @@ export async function dispatchAdminApiRequest(
     }
 
     if (routeKey === "GET /settings") {
+      await requireAdminPermission(admin, "settings:manage", req, routeKey);
       const settings = await getAdminPlatformSettings();
       return { status: 200, body: { success: true, data: settings } };
     }
 
     if (routeKey === "PATCH /settings") {
+      await requireAdminPermission(admin, "settings:manage", req, routeKey);
       const parsed = updatePlatformSettingsSchema.parse(req.body);
       const updated = await updateAdminPlatformSettings({
         settings: parsed.settings,
@@ -762,7 +907,7 @@ export async function dispatchAdminApiRequest(
         success: false,
         error: {
           code: "ENDPOINT_NOT_FOUND",
-          message: `Admin API endpoint not found: ${routeKey}`,
+          message: "Requested administrative API endpoint does not exist.",
         },
       },
     };
@@ -776,7 +921,10 @@ export async function dispatchAdminApiRequest(
           error: {
             code: "VALIDATION_ERROR",
             message: firstIssue?.message || "Invalid request payload.",
-            details: error.issues,
+            details: error.issues.map((i) => ({
+              path: i.path,
+              message: i.message,
+            })),
           },
         },
       };
@@ -795,17 +943,45 @@ export async function dispatchAdminApiRequest(
       };
     }
 
-    console.error("[Admin API Error]", error);
+    if (error instanceof AdminMailDeliveryError) {
+      return {
+        status: error.statusCode,
+        body: {
+          success: false,
+          error: {
+            code: error.code,
+            message: error.message,
+          },
+        },
+      };
+    }
+
+    if (error instanceof AdminCryptoSecretError) {
+      console.error(
+        "[Admin Security Config Error]",
+        sanitizeErrorForServerLog(error)
+      );
+      return {
+        status: 500,
+        body: {
+          success: false,
+          error: {
+            code: "SERVER_SECURITY_CONFIGURATION_ERROR",
+            message:
+              "Administrative authentication service is temporarily unavailable.",
+          },
+        },
+      };
+    }
+
+    console.error("[Admin API Error]", sanitizeErrorForServerLog(error));
     return {
       status: 500,
       body: {
         success: false,
         error: {
           code: "INTERNAL_SERVER_ERROR",
-          message:
-            error instanceof Error
-              ? error.message
-              : "An unexpected server error occurred.",
+          message: "An unexpected server error occurred. Please try again later.",
         },
       },
     };

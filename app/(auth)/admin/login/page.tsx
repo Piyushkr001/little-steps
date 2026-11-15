@@ -31,12 +31,6 @@ import { hasAdminEmailKeyword } from "@/lib/admin/validation";
 import { adminAuth } from "@/lib/api/admin-api";
 import { AdminApiClientError } from "@/lib/api/axios-client";
 
-const AUTHORIZED_DEMO_ADMINS = [
-  { email: "admin@littlesteps.com", label: "Primary Admin" },
-  { email: "superadmin@littlesteps.com", label: "Super Admin" },
-  { email: "littlesteps.admin@gmail.com", label: "Compliance Admin" },
-];
-
 function AdminLoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -235,35 +229,6 @@ function AdminLoginForm() {
                 <ArrowRight className="size-4" />
               </Button>
             </form>
-
-            {/* Quick-fill Provisioned Admin Accounts for Testing */}
-            <div className="rounded-2xl border border-dashed border-slate-200 bg-slate-50/70 p-3.5 dark:border-border dark:bg-muted/30">
-              <p className="mb-2 text-xs font-semibold text-slate-600 dark:text-muted-foreground">
-                Provisioned Administrator Accounts (Click to autofill):
-              </p>
-              <div className="flex flex-wrap gap-1.5">
-                {AUTHORIZED_DEMO_ADMINS.map((acct) => (
-                  <button
-                    key={acct.email}
-                    type="button"
-                    onClick={() => {
-                      setEmail(acct.email);
-                      setErrorMessage(null);
-                    }}
-                    className="rounded-full border border-[#087F78]/25 bg-white px-2.5 py-1 text-xs font-medium text-[#087F78] transition-colors hover:bg-[#EAF8F5] dark:bg-background dark:text-teal-300"
-                  >
-                    {acct.email}
-                  </button>
-                ))}
-              </div>
-              <p className="mt-2.5 text-[11px] leading-relaxed text-slate-500 dark:text-muted-foreground">
-                <strong>Demo OTP for Demo Accounts:</strong> Use code{" "}
-                <code className="rounded bg-[#EAF8F5] px-1.5 py-0.5 font-mono text-xs font-bold text-[#087F78] dark:bg-teal-950 dark:text-teal-300">
-                  123456
-                </code>{" "}
-                on the next step (valid for 5 minutes, single-use).
-              </p>
-            </div>
           </CardContent>
 
           <CardFooter className="flex justify-between border-t pt-4 text-xs text-slate-500 dark:text-muted-foreground">

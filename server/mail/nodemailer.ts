@@ -1,4 +1,5 @@
 import nodemailer, { type Transporter } from "nodemailer";
+import { hasAdminEmailKeyword } from "../../lib/admin/validation";
 import { OTP_EXPIRY_MINUTES } from "../security/crypto";
 
 export interface SendAdminOtpEmailInput {
@@ -8,43 +9,66 @@ export interface SendAdminOtpEmailInput {
   ipAddress?: string;
 }
 
-let cachedTransporter: Transporter | null = null;
-let lastSentTestOtp: { email: string; otp: string; sentAt: Date } | null = null;
+export class AdminMailDeliveryError extends Error {
+  readonly code = "ADMIN_OTP_EMAIL_DELIVERY_FAILED";
+  readonly statusCode = 503;
 
-export function getLastSentTestOtpForTestingOnly() {
-  if (process.env.NODE_ENV === "production") {
-    return null;
+  constructor(
+    message = "Unable to deliver the verification code email at this time. Please try again shortly."
+  ) {
+    super(message);
+    this.name = "AdminMailDeliveryError";
   }
-  return lastSentTestOtp;
 }
 
-function createMailTransporter(): Transporter {
+export type AdminOtpMailInterceptor = (
+  input: SendAdminOtpEmailInput
+) => Promise<void> | void;
+
+let cachedTransporter: Transporter | null = null;
+let testMailInterceptor: AdminOtpMailInterceptor | null = null;
+
+/**
+ * Controlled dependency injection hook for isolated automated tests only.
+ * Explicitly disabled in production.
+ */
+export function setAdminOtpMailInterceptorForTests(
+  interceptor: AdminOtpMailInterceptor | null
+): void {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error(
+      "Mail interceptor injection is prohibited in production environments."
+    );
+  }
+  testMailInterceptor = interceptor;
+}
+
+function createSmtpTransporter(): Transporter {
   if (cachedTransporter) return cachedTransporter;
 
-  const host = process.env.SMTP_HOST;
+  const host = process.env.SMTP_HOST?.trim();
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER?.trim();
   const pass = process.env.SMTP_PASS?.replace(/\s+/g, "");
   const secure =
     process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465;
 
-  if (host && user && pass) {
-    cachedTransporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: {
-        user,
-        pass,
-      },
-    });
-    return cachedTransporter;
+  if (!host || !user || !pass) {
+    throw new AdminMailDeliveryError(
+      "Email delivery service is not configured. Please contact platform security operations."
+    );
   }
 
-  // Safe local/test fallback transport when SMTP credentials are not yet configured
   cachedTransporter = nodemailer.createTransport({
-    jsonTransport: true,
+    host,
+    port,
+    secure,
+    auth: {
+      user,
+      pass,
+    },
   });
+
   return cachedTransporter;
 }
 
@@ -123,8 +147,25 @@ export function buildAdminOtpEmailHtml(params: {
 
 export async function sendAdminOtpEmail(
   input: SendAdminOtpEmailInput
-): Promise<{ delivered: boolean; transportMode: "smtp" | "local-fallback" }> {
-  const transporter = createMailTransporter();
+): Promise<{ delivered: true; transportMode: "smtp" | "test-interceptor" }> {
+  const recipient = input.toEmail.trim().toLowerCase();
+
+  if (!hasAdminEmailKeyword(recipient)) {
+    throw new AdminMailDeliveryError(
+      "Refusing to dispatch administrative OTP to an ineligible email address."
+    );
+  }
+
+  if (!/^\d{6}$/.test(input.otpCode)) {
+    throw new AdminMailDeliveryError("Invalid OTP format for email dispatch.");
+  }
+
+  if (testMailInterceptor && process.env.NODE_ENV !== "production") {
+    await testMailInterceptor({ ...input, toEmail: recipient });
+    return { delivered: true, transportMode: "test-interceptor" };
+  }
+
+  const transporter = createSmtpTransporter();
   const smtpUser = process.env.SMTP_USER?.trim();
   const fromAddress =
     process.env.SMTP_FROM ||
@@ -133,25 +174,6 @@ export async function sendAdminOtpEmail(
       ? `Little Steps Security <${smtpUser}>`
       : "Little Steps Security <no-reply@littlesteps.com>");
   const appUrl = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-
-  // In non-production, demo admin accounts use the demo OTP (123456) without requiring external SMTP delivery
-  const isDemoRecipient =
-    input.toEmail.endsWith("@littlesteps.com") ||
-    input.toEmail === "littlesteps.admin@gmail.com";
-
-  if (process.env.NODE_ENV !== "production") {
-    lastSentTestOtp = {
-      email: input.toEmail,
-      otp: input.otpCode,
-      sentAt: new Date(),
-    };
-    console.info(
-      `[LittleSteps Admin OTP Dev Mailer] Recipient: ${input.toEmail} | OTP: ${input.otpCode} (expires in ${OTP_EXPIRY_MINUTES}m)`
-    );
-    if (isDemoRecipient) {
-      return { delivered: true, transportMode: "local-fallback" };
-    }
-  }
 
   const html = buildAdminOtpEmailHtml({
     adminName: input.adminName,
@@ -169,37 +191,30 @@ export async function sendAdminOtpEmail(
     `If you did not request this login, please ignore this message or notify security operations.`,
   ].join("\n\n");
 
-  const isSmtpConfigured = Boolean(
-    process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS
-  );
-
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       await transporter.sendMail({
         from: fromAddress,
-        to: input.toEmail,
+        to: recipient,
         subject: "Little Steps Admin Portal — Login Verification Code",
         text,
         html,
       });
       return {
         delivered: true,
-        transportMode: isSmtpConfigured ? "smtp" : "local-fallback",
+        transportMode: "smtp",
       };
     } catch (err) {
       lastError = err;
     }
   }
 
-  console.error("[LittleSteps Mailer] Failed to dispatch OTP email:", {
-    recipient: input.toEmail,
-    error: lastError instanceof Error ? lastError.message : "Unknown SMTP error",
+  // Never log the OTP code or SMTP password in operational error logs
+  console.error("[LittleSteps Mailer] SMTP delivery failure:", {
+    recipientDomain: recipient.split("@")[1] ?? "unknown",
+    errorType: lastError instanceof Error ? lastError.name : "UnknownSmtpError",
   });
 
-  if (process.env.NODE_ENV !== "production") {
-    return { delivered: true, transportMode: "local-fallback" };
-  }
-
-  throw new Error("Unable to send verification email at this time.");
+  throw new AdminMailDeliveryError();
 }

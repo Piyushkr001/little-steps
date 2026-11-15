@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
-import { db } from "@/config/db";
+import { db } from "../../config/db";
 import {
   adminAuditLogs,
   adminProfiles,
@@ -19,18 +19,17 @@ import {
   userRoles,
   users,
   verificationDocuments,
-} from "@/config/schema";
+} from "../../config/schema";
 import type {
   AccountStatus,
   AuthenticatedAdmin,
   BookingStatus,
   CenterListingStatus,
   IncidentStatus,
-} from "@/lib/admin/types";
-import { ALLOWED_BOOKING_TRANSITIONS } from "@/lib/admin/validation";
+} from "../../lib/admin/types";
+import { ALLOWED_BOOKING_TRANSITIONS } from "../../lib/admin/validation";
 import { AdminAuthError } from "./admin-auth.service";
 import { recordAdminAuditLog } from "./audit.service";
-import { ensureAdminPortalSeeded } from "./seed.service";
 
 // ==========================================
 // 1. User Management
@@ -43,7 +42,6 @@ export async function listAdminUsers(filters: {
   page?: number;
   limit?: number;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [allUsers, allBookings] = await Promise.all([
     db.select().from(users).orderBy(desc(users.createdAt)),
@@ -101,7 +99,6 @@ export async function listAdminUsers(filters: {
 }
 
 export async function getAdminUserById(userId: string) {
-  await ensureAdminPortalSeeded();
 
   const [user] = await db
     .select()
@@ -181,7 +178,6 @@ export async function updateAdminUserStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [target] = await db
     .select()
@@ -290,7 +286,6 @@ export async function listAdminProviders(filters: {
   search?: string;
   verificationStatus?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [allProviders, allCenters, allDocs, allVerifications, allUsers] =
     await Promise.all([
@@ -359,7 +354,6 @@ export async function listAdminProviders(filters: {
 }
 
 export async function getAdminProviderById(providerId: string) {
-  await ensureAdminPortalSeeded();
 
   const [provider] = await db
     .select()
@@ -448,7 +442,6 @@ export async function listAdminVerifications(filters: {
   status?: string;
   search?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [verificationsRows, allProviders, allCenters, allDocs, allUsers] =
     await Promise.all([
@@ -544,7 +537,6 @@ export async function approveProviderVerification(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [verification] = await db
     .select()
@@ -668,7 +660,6 @@ export async function rejectProviderVerification(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [verification] = await db
     .select()
@@ -772,7 +763,6 @@ export async function requestProviderDocuments(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [verification] = await db
     .select()
@@ -862,7 +852,6 @@ export async function listAdminCenters(filters: {
   verificationStatus?: string;
   city?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [allCenters, allProviders, allCaregivers, allIncidents] =
     await Promise.all([
@@ -951,7 +940,6 @@ export async function listAdminCenters(filters: {
 }
 
 export async function getAdminCenterById(centerId: string) {
-  await ensureAdminPortalSeeded();
 
   const [center] = await db
     .select()
@@ -1046,7 +1034,6 @@ export async function updateAdminCenterStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [center] = await db
     .select()
@@ -1132,7 +1119,6 @@ export async function listAdminBookings(filters: {
   centerId?: string;
   providerId?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [allBookings, allUsers, allCenters, allProviders, allChildren, allDisputes] =
     await Promise.all([
@@ -1226,7 +1212,6 @@ export async function listAdminBookings(filters: {
 }
 
 export async function getAdminBookingById(bookingId: string) {
-  await ensureAdminPortalSeeded();
 
   const [booking] = await db
     .select()
@@ -1329,7 +1314,6 @@ export async function transitionAdminBookingStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [booking] = await db
     .select()
@@ -1421,7 +1405,6 @@ export async function listAdminIncidents(filters: {
   category?: string;
   search?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [allIncidents, allCenters, allBookings, allUsers] = await Promise.all([
     db.select().from(safetyIncidents).orderBy(desc(safetyIncidents.occurredAt)),
@@ -1499,7 +1482,6 @@ export async function listAdminIncidents(filters: {
 }
 
 export async function getAdminIncidentById(incidentId: string) {
-  await ensureAdminPortalSeeded();
 
   const [incident] = await db
     .select()
@@ -1590,7 +1572,6 @@ export async function updateAdminIncidentStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [incident] = await db
     .select()
@@ -1664,7 +1645,6 @@ export async function addAdminIncidentNote(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
 
   const [incident] = await db
     .select()
@@ -1722,7 +1702,6 @@ export async function addAdminIncidentNote(params: {
 // ==========================================
 
 export async function getAdminReportsData() {
-  await ensureAdminPortalSeeded();
 
   const [
     allUsers,
@@ -1826,7 +1805,6 @@ export async function listAdminAuditLogs(filters: {
   search?: string;
   limit?: number;
 }) {
-  await ensureAdminPortalSeeded();
 
   const rows = await db
     .select()
@@ -1879,17 +1857,22 @@ export async function listAdminAuditLogs(filters: {
 }
 
 export async function getAdminPlatformSettings() {
-  await ensureAdminPortalSeeded();
 
   const rows = await db.select().from(platformSettings);
-  return rows.map((r) => ({
-    id: r.id,
-    settingKey: r.settingKey,
-    settingValue: r.settingValue,
-    category: r.category,
-    description: r.description,
-    updatedAt: r.updatedAt.toISOString(),
-  }));
+  return rows
+    .filter(
+      (r) =>
+        r.category !== "RATE_LIMIT_INTERNAL" &&
+        !r.settingKey.startsWith("ratelimit:")
+    )
+    .map((r) => ({
+      id: r.id,
+      settingKey: r.settingKey,
+      settingValue: r.settingValue,
+      category: r.category,
+      description: r.description,
+      updatedAt: r.updatedAt.toISOString(),
+    }));
 }
 
 export async function updateAdminPlatformSettings(params: {
@@ -1903,11 +1886,19 @@ export async function updateAdminPlatformSettings(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  await ensureAdminPortalSeeded();
-
   const now = new Date();
 
   for (const item of params.settings) {
+    if (
+      item.settingKey.startsWith("ratelimit:") ||
+      item.category === "RATE_LIMIT_INTERNAL"
+    ) {
+      throw new AdminAuthError(
+        "RESERVED_SETTING_KEY",
+        "Cannot modify internal rate-limiting state through platform settings.",
+        400
+      );
+    }
     const [existing] = await db
       .select()
       .from(platformSettings)

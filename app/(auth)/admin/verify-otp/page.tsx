@@ -222,20 +222,6 @@ function VerifyOtpContent() {
                     </span>
                   )}
                 </div>
-
-                {(email.endsWith("@littlesteps.com") ||
-                  email === "littlesteps.admin@gmail.com") && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOtp("123456");
-                      setErrorMessage(null);
-                    }}
-                    className="mt-1 rounded-full border border-[#087F78]/30 bg-[#EAF8F5] px-3 py-1 text-xs font-semibold text-[#087F78] transition-colors hover:bg-[#d5f1eb] dark:bg-teal-950/60 dark:text-teal-300"
-                  >
-                    Demo Account OTP: <span className="font-mono font-bold">123456</span> (Click to autofill)
-                  </button>
-                )}
               </div>
 
               <Button
