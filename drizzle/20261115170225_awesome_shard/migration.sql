@@ -101,7 +101,7 @@ ALTER TABLE "centers" ADD CONSTRAINT "centers_verified_by_users_id_fkey" FOREIGN
 ALTER TABLE "verification_documents" ADD CONSTRAINT "verification_documents_caregiver_id_caregivers_id_fkey" FOREIGN KEY ("caregiver_id") REFERENCES "caregivers"("id") ON DELETE SET NULL;--> statement-breakpoint
 ALTER TABLE "verification_review_history" ADD CONSTRAINT "verification_review_history_reviewer_id_users_id_fkey" FOREIGN KEY ("reviewer_id") REFERENCES "users"("id") ON DELETE SET NULL;--> statement-breakpoint
 ALTER TABLE "bookings" ADD CONSTRAINT "bookings_total_amount_nonneg" CHECK ("total_amount" >= 0);--> statement-breakpoint
-ALTER TABLE "bookings" ADD CONSTRAINT "bookings_valid_time_range" CHECK ("end_time" > "start_time");--> statement-breakpoint
+ALTER TABLE "bookings" ADD CONSTRAINT "bookings_valid_time_range" CHECK ("end_time" > "start_time") NOT VALID;--> statement-breakpoint
 ALTER TABLE "bookings" ADD CONSTRAINT "bookings_payment_status_valid" CHECK ("payment_status" IN ('UNPAID', 'PENDING', 'PAID', 'PARTIALLY_REFUNDED', 'REFUNDED', 'DISPUTED', 'FAILED'));--> statement-breakpoint
 ALTER TABLE "capacity_rules" ADD CONSTRAINT "capacity_rules_max_children_pos" CHECK ("max_children" > 0);--> statement-breakpoint
 ALTER TABLE "caregivers" ADD CONSTRAINT "caregivers_years_exp_nonneg" CHECK ("years_experience" >= 0);--> statement-breakpoint
