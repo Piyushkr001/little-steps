@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import nodemailer, { type Transporter } from "nodemailer";
 import { hasAdminEmailKeyword } from "../../lib/admin/validation";
 import { OTP_EXPIRY_MINUTES } from "../security/crypto";
@@ -26,6 +27,7 @@ export type AdminOtpMailInterceptor = (
 ) => Promise<void> | void;
 
 let cachedTransporter: Transporter | null = null;
+let cachedTransporterKey: string | null = null;
 let testMailInterceptor: AdminOtpMailInterceptor | null = null;
 
 /**
@@ -44,8 +46,6 @@ export function setAdminOtpMailInterceptorForTests(
 }
 
 function createSmtpTransporter(): Transporter {
-  if (cachedTransporter) return cachedTransporter;
-
   const host = process.env.SMTP_HOST?.trim();
   const port = Number(process.env.SMTP_PORT || 587);
   const user = process.env.SMTP_USER?.trim();
@@ -59,15 +59,29 @@ function createSmtpTransporter(): Transporter {
     );
   }
 
+  // Invalidate cached transporter automatically if Next.js reloads .env values
+  const configKey = crypto
+    .createHash("sha256")
+    .update(`${host}\0${port}\0${secure}\0${user}\0${pass}`)
+    .digest("hex");
+
+  if (cachedTransporter && cachedTransporterKey === configKey) {
+    return cachedTransporter;
+  }
+
   cachedTransporter = nodemailer.createTransport({
     host,
     port,
     secure,
+    connectionTimeout: 10_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 15_000,
     auth: {
       user,
       pass,
     },
   });
+  cachedTransporterKey = configKey;
 
   return cachedTransporter;
 }
@@ -193,9 +207,11 @@ export async function sendAdminOtpEmail(
 
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const activeTransporter =
+      attempt === 1 ? transporter : createSmtpTransporter();
     try {
-      await transporter.sendMail({
-        from: fromAddress,
+      await activeTransporter.sendMail({
+        from: fromAddress.trim(),
         to: recipient,
         subject: "Little Steps Admin Portal — Login Verification Code",
         text,
@@ -207,13 +223,29 @@ export async function sendAdminOtpEmail(
       };
     } catch (err) {
       lastError = err;
+      cachedTransporter = null;
+      cachedTransporterKey = null;
+
+      const smtpErr = err as { code?: string; responseCode?: number } | null;
+      if (smtpErr?.code === "EAUTH" || smtpErr?.responseCode === 535) {
+        break;
+      }
     }
   }
 
-  // Never log the OTP code or SMTP password in operational error logs
+  const smtpMeta = lastError as {
+    code?: string;
+    responseCode?: number;
+    command?: string;
+  } | null;
+
+  // Never log the OTP code, SMTP username, or SMTP password in operational error logs
   console.error("[LittleSteps Mailer] SMTP delivery failure:", {
     recipientDomain: recipient.split("@")[1] ?? "unknown",
     errorType: lastError instanceof Error ? lastError.name : "UnknownSmtpError",
+    errorCode: smtpMeta?.code ?? "UNKNOWN",
+    responseCode: smtpMeta?.responseCode ?? null,
+    command: smtpMeta?.command ?? null,
   });
 
   throw new AdminMailDeliveryError();
