@@ -86,6 +86,15 @@ function createSmtpTransporter(): Transporter {
   return cachedTransporter;
 }
 
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 export function buildAdminOtpEmailHtml(params: {
   adminName: string;
   otpCode: string;
@@ -93,6 +102,13 @@ export function buildAdminOtpEmailHtml(params: {
   appUrl: string;
 }): string {
   const { adminName, otpCode, expiryMinutes, appUrl } = params;
+  const safeAdminName = escapeHtml(adminName);
+  const safeOtpCode = escapeHtml(otpCode);
+  const isHttpsPublicUrl = /^https:\/\//i.test(appUrl);
+  const supportReference = isHttpsPublicUrl
+    ? `<a href="${escapeHtml(appUrl)}/contact" style="color:#087F78;text-decoration:underline;">${escapeHtml(appUrl)}</a>`
+    : "the Little Steps Admin Security desk";
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -118,7 +134,7 @@ export function buildAdminOtpEmailHtml(params: {
           <tr>
             <td style="padding:32px;">
               <p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#334155;">
-                Hello <strong>${adminName}</strong>,
+                Hello <strong>${safeAdminName}</strong>,
               </p>
               <p style="margin:0 0 24px;font-size:15px;line-height:1.6;color:#334155;">
                 A sign-in attempt was initiated for your <strong>Little Steps Admin Portal</strong> account. Enter the six-digit verification code below to complete authentication:
@@ -128,7 +144,7 @@ export function buildAdminOtpEmailHtml(params: {
                   One-Time Verification Code
                 </span>
                 <span style="font-size:36px;font-weight:800;letter-spacing:10px;color:#087F78;font-family:'Courier New',Courier,monospace;">
-                  ${otpCode}
+                  ${safeOtpCode}
                 </span>
               </div>
               <p style="margin:0 0 16px;font-size:14px;line-height:1.6;color:#475569;">
@@ -140,7 +156,7 @@ export function buildAdminOtpEmailHtml(params: {
                 </p>
               </div>
               <p style="margin:0;font-size:13px;line-height:1.6;color:#64748B;">
-                <strong>Didn't request this login?</strong> If you did not initiate this request, you can safely ignore this email—your account remains protected. If you suspect unauthorized activity, please contact the Little Steps Security Operations team immediately via <a href="${appUrl}/contact" style="color:#087F78;text-decoration:underline;">${appUrl}</a>.
+                <strong>Didn't request this login?</strong> If you did not initiate this request, you can safely ignore this email—your account remains protected. If you suspect unauthorized activity, please contact ${supportReference}.
               </p>
             </td>
           </tr>
@@ -210,13 +226,34 @@ export async function sendAdminOtpEmail(
     const activeTransporter =
       attempt === 1 ? transporter : createSmtpTransporter();
     try {
-      await activeTransporter.sendMail({
+      const info = await activeTransporter.sendMail({
         from: fromAddress.trim(),
         to: recipient,
         subject: "Little Steps Admin Portal — Login Verification Code",
         text,
         html,
       });
+
+      const acceptedCount = Array.isArray(info.accepted)
+        ? info.accepted.length
+        : 0;
+      const rejectedCount = Array.isArray(info.rejected)
+        ? info.rejected.length
+        : 0;
+
+      if (acceptedCount === 0 || rejectedCount > 0) {
+        throw new AdminMailDeliveryError(
+          "SMTP server did not accept the recipient email address."
+        );
+      }
+
+      // Log non-secret delivery confirmation only (never log OTP codes or credentials)
+      console.info("[LittleSteps Mailer] SMTP delivery accepted:", {
+        recipientDomain: recipient.split("@")[1] ?? "unknown",
+        acceptedCount,
+        rejectedCount,
+      });
+
       return {
         delivered: true,
         transportMode: "smtp",
