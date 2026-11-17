@@ -19,6 +19,7 @@ import {
   updateIncidentStatusSchema,
   updatePlatformSettingsSchema,
   updateUserStatusSchema,
+  uploadVerificationDocumentSchema,
   verifyOtpSchema,
 } from "../lib/admin/validation";
 import { AdminMailDeliveryError } from "./mail/nodemailer";
@@ -30,6 +31,7 @@ import {
   ADMIN_SESSION_TTL_HOURS,
   AdminCryptoSecretError,
   verifyCsrfToken,
+  verifySignedDocumentAccessToken,
 } from "./security/crypto";
 import { hasAdminPermission } from "./security/permissions";
 import {
@@ -45,6 +47,12 @@ import {
   getAdminDashboardAnalytics,
   getAdminDashboardStats,
 } from "./services/dashboard.service";
+import {
+  MAX_DOCUMENT_SIZE_BYTES,
+  readAuthorizedDocumentContent,
+  runAndPersistDocumentScan,
+  uploadAndRegisterVerificationDocument,
+} from "./services/document-storage.service";
 import {
   addAdminIncidentNote,
   approveCaregiverVerification,
@@ -215,7 +223,7 @@ function validateMutatingRequestOrigin(req: UnifiedApiRequest): void {
   }
 }
 
-async function requireAuthenticatedAdmin(
+export async function requireAuthenticatedAdmin(
   req: UnifiedApiRequest,
   enforceCsrfForMutating = true
 ): Promise<AuthenticatedAdmin> {
@@ -275,7 +283,7 @@ async function requireAuthenticatedAdmin(
  * Centralized server-side permission guard.
  * Kept strictly separate from session authentication (`requireAuthenticatedAdmin`).
  */
-async function requireAdminPermission(
+export async function requireAdminPermission(
   admin: AuthenticatedAdmin,
   requiredPermission: AdminPermission,
   req: UnifiedApiRequest,
@@ -614,6 +622,7 @@ export async function dispatchAdminApiRequest(
         verificationId: req.segments[1],
         reviewComments: parsed.reviewComments,
         checklistState: parsed.checklistState,
+        expiresAt: parsed.expiresAt,
         admin,
         ipAddress: req.ipAddress,
         userAgent: req.userAgent,
@@ -720,6 +729,7 @@ export async function dispatchAdminApiRequest(
         checklistState: parsed.checklistState,
         safetyComplianceNotes: parsed.safetyComplianceNotes,
         activateListing: parsed.activateListing,
+        expiresAt: parsed.expiresAt,
         admin,
         ipAddress: req.ipAddress,
         userAgent: req.userAgent,
@@ -891,8 +901,114 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 2
     ) {
       await requireAdminPermission(admin, "providers:read", req, routeKey);
-      const item = await getAdminVerificationDocumentById(req.segments[1]);
+      const item = await getAdminVerificationDocumentById(
+        req.segments[1],
+        admin.id
+      );
       return { status: 200, body: { success: true, data: item } };
+    }
+
+    if (routeKey === "POST /verification-documents/upload") {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const [ipLimit, acctLimit] = await Promise.all([
+        checkRateLimit(`doc-upload-ip:${req.ipAddress}`, 30, 10 * 60_000),
+        checkRateLimit(`doc-upload-acct:${admin.id}`, 30, 10 * 60_000),
+      ]);
+      if (!ipLimit.allowed || !acctLimit.allowed) {
+        return {
+          status: 429,
+          body: {
+            success: false,
+            error: {
+              code: "RATE_LIMIT_EXCEEDED",
+              message:
+                "Too many document upload requests. Please try again shortly.",
+            },
+          },
+        };
+      }
+
+      const parsed = uploadVerificationDocumentSchema.parse(req.body);
+      const fileBuffer = Buffer.from(parsed.fileBase64, "base64");
+      if (
+        fileBuffer.byteLength === 0 ||
+        fileBuffer.byteLength > MAX_DOCUMENT_SIZE_BYTES
+      ) {
+        throw new AdminAuthError(
+          "INVALID_DOCUMENT_SIZE",
+          "Uploaded verification document must be between 1 byte and 10 MB.",
+          400
+        );
+      }
+
+      const expiresAtDate = parsed.expiresAt ? new Date(parsed.expiresAt) : null;
+      const result = await uploadAndRegisterVerificationDocument({
+        providerId: parsed.providerId,
+        centerId: parsed.centerId ?? null,
+        caregiverId: parsed.caregiverId ?? null,
+        documentCategory: parsed.documentCategory,
+        documentType: parsed.documentType,
+        documentTitle: parsed.documentTitle,
+        fileName: parsed.fileName,
+        declaredMimeType: parsed.mimeType,
+        buffer: fileBuffer,
+        expiresAt: expiresAtDate,
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+
+      return {
+        status: 201,
+        body: {
+          success: true,
+          message:
+            result.malwareScanStatus === "CLEAN"
+              ? "Verification document uploaded and scanned cleanly."
+              : "Verification document uploaded to private storage with PENDING malware scan.",
+          data: result,
+        },
+      };
+    }
+
+    if (
+      method === "POST" &&
+      req.segments[0] === "verification-documents" &&
+      req.segments.length === 3 &&
+      req.segments[2] === "scan"
+    ) {
+      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      const [ipLimit, acctLimit] = await Promise.all([
+        checkRateLimit(`doc-scan-ip:${req.ipAddress}`, 30, 10 * 60_000),
+        checkRateLimit(`doc-scan-acct:${admin.id}`, 30, 10 * 60_000),
+      ]);
+      if (!ipLimit.allowed || !acctLimit.allowed) {
+        return {
+          status: 429,
+          body: {
+            success: false,
+            error: {
+              code: "RATE_LIMIT_EXCEEDED",
+              message: "Too many malware scan requests. Please wait shortly.",
+            },
+          },
+        };
+      }
+
+      const result = await runAndPersistDocumentScan({
+        documentId: req.segments[1],
+        admin,
+        ipAddress: req.ipAddress,
+        userAgent: req.userAgent,
+      });
+      return {
+        status: 200,
+        body: {
+          success: true,
+          message: `Malware scan finished with status ${result.malwareScanStatus}.`,
+          data: result,
+        },
+      };
     }
 
     if (
@@ -902,13 +1018,11 @@ export async function dispatchAdminApiRequest(
       req.segments[2] === "approve"
     ) {
       await requireAdminPermission(admin, "providers:verify", req, routeKey);
-      const parsed = approveVerificationDocumentSchema.parse(req.body ?? {});
+      const parsed = approveVerificationDocumentSchema.parse(req.body);
       const result = await approveVerificationDocument({
         documentId: req.segments[1],
-        reviewNotes:
-          parsed.reviewNotes ||
-          parsed.reviewComments ||
-          "Verified document authenticity and compliance.",
+        reviewNotes: parsed.reviewNotes,
+        evidenceReviewed: parsed.evidenceReviewed,
         expiresAt: parsed.expiresAt,
         admin,
         ipAddress: req.ipAddress,
@@ -935,9 +1049,8 @@ export async function dispatchAdminApiRequest(
       const result = await rejectVerificationDocument({
         documentId: req.segments[1],
         rejectionReason: parsed.rejectionReason,
-        reviewNotes: parsed.reviewNotes || parsed.reviewComments,
-        requestReplacement:
-          parsed.requestReplacement ?? parsed.replacementRequested,
+        reviewNotes: parsed.reviewNotes,
+        requestReplacement: parsed.requestReplacement,
         admin,
         ipAddress: req.ipAddress,
         userAgent: req.userAgent,
@@ -1201,78 +1314,163 @@ export async function dispatchAdminApiRequest(
       },
     };
   } catch (error) {
-    if (error instanceof ZodError) {
-      const firstIssue = error.issues[0];
-      return {
-        status: 400,
-        body: {
-          success: false,
-          error: {
-            code: "VALIDATION_ERROR",
-            message: firstIssue?.message || "Invalid request payload.",
-            details: error.issues.map((i) => ({
-              path: i.path,
-              message: i.message,
-            })),
-          },
-        },
-      };
-    }
+    return mapAdminApiError(error);
+  }
+}
 
-    if (error instanceof AdminAuthError) {
-      return {
-        status: error.statusCode,
-        body: {
-          success: false,
-          error: {
-            code: error.code,
-            message: error.message,
-          },
+export function mapAdminApiError(error: unknown): UnifiedApiResponse {
+  if (error instanceof ZodError) {
+    const firstIssue = error.issues[0];
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          message: firstIssue?.message || "Invalid request payload.",
+          details: error.issues.map((i) => ({
+            path: i.path,
+            message: i.message,
+          })),
         },
-      };
-    }
+      },
+    };
+  }
 
-    if (error instanceof AdminMailDeliveryError) {
-      return {
-        status: error.statusCode,
-        body: {
-          success: false,
-          error: {
-            code: error.code,
-            message: error.message,
-          },
+  if (error instanceof AdminAuthError) {
+    return {
+      status: error.statusCode,
+      body: {
+        success: false,
+        error: {
+          code: error.code,
+          message: error.message,
         },
-      };
-    }
+      },
+    };
+  }
 
-    if (error instanceof AdminCryptoSecretError) {
-      console.error(
-        "[Admin Security Config Error]",
-        sanitizeErrorForServerLog(error)
-      );
-      return {
-        status: 500,
-        body: {
-          success: false,
-          error: {
-            code: "SERVER_SECURITY_CONFIGURATION_ERROR",
-            message:
-              "Administrative authentication service is temporarily unavailable.",
-          },
+  if (error instanceof AdminMailDeliveryError) {
+    return {
+      status: error.statusCode,
+      body: {
+        success: false,
+        error: {
+          code: error.code,
+          message: error.message,
         },
-      };
-    }
+      },
+    };
+  }
 
-    console.error("[Admin API Error]", sanitizeErrorForServerLog(error));
+  if (error instanceof AdminCryptoSecretError) {
+    console.error(
+      "[Admin Security Config Error]",
+      sanitizeErrorForServerLog(error)
+    );
     return {
       status: 500,
       body: {
         success: false,
         error: {
-          code: "INTERNAL_SERVER_ERROR",
-          message: "An unexpected server error occurred. Please try again later.",
+          code: "SERVER_SECURITY_CONFIGURATION_ERROR",
+          message:
+            "Administrative authentication service is temporarily unavailable.",
         },
       },
+    };
+  }
+
+  console.error("[Admin API Error]", sanitizeErrorForServerLog(error));
+  return {
+    status: 500,
+    body: {
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "An unexpected server error occurred. Please try again later.",
+      },
+    },
+  };
+}
+
+export async function handleDocumentContentStreamRequest(
+  req: UnifiedApiRequest,
+  documentId: string
+): Promise<
+  | {
+      ok: true;
+      buffer: Buffer;
+      mimeType: string;
+      headers: Record<string, string>;
+    }
+  | {
+      ok: false;
+      response: UnifiedApiResponse;
+    }
+> {
+  try {
+    const admin = await requireAuthenticatedAdmin(req, false);
+    const routeKey = `GET /verification-documents/${documentId}/content`;
+    await requireAdminPermission(admin, "providers:read", req, routeKey);
+
+    const tokenParam = req.query.token;
+    if (tokenParam) {
+      const validToken = verifySignedDocumentAccessToken(
+        tokenParam,
+        documentId,
+        admin.id
+      );
+      if (!validToken) {
+        await recordAdminAuditLog({
+          adminUserId: admin.id,
+          adminEmail: admin.email,
+          action: "DOCUMENT_ACCESS_TOKEN_REJECTED",
+          entityType: "VERIFICATION_DOCUMENT",
+          entityId: documentId,
+          summary: `Rejected invalid or mismatched signed document access token by ${admin.email}`,
+          outcome: "DENIED",
+          ipAddress: req.ipAddress,
+          userAgent: req.userAgent,
+        });
+        throw new AdminAuthError(
+          "INVALID_DOCUMENT_ACCESS_TOKEN",
+          "Signed document access token is invalid, expired, or belongs to a different administrator.",
+          403
+        );
+      }
+    }
+
+    const content = await readAuthorizedDocumentContent({
+      documentId,
+      expectedProviderId: req.query.providerId,
+      expectedCenterId: req.query.centerId,
+      expectedCaregiverId: req.query.caregiverId,
+      admin,
+      ipAddress: req.ipAddress,
+      userAgent: req.userAgent,
+    });
+
+    const safeFileName = content.fileName.replace(/["\\\r\n;]/g, "_");
+    const disposition = req.query.download === "1" ? "attachment" : "inline";
+
+    return {
+      ok: true,
+      buffer: content.buffer,
+      mimeType: content.mimeType,
+      headers: {
+        "Content-Type": content.mimeType,
+        "Content-Length": String(content.buffer.byteLength),
+        "Content-Disposition": `${disposition}; filename="${safeFileName}"`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, private",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      response: mapAdminApiError(error),
     };
   }
 }

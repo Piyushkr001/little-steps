@@ -1,5 +1,5 @@
 import { desc } from "drizzle-orm";
-import { db } from "../../config/db";
+import { db, type DbClientOrTx } from "../../config/db";
 import { adminAuditLogs } from "../../config/schema";
 import { computeAuditIntegrityHash } from "../security/crypto";
 
@@ -89,7 +89,10 @@ function inferDefaultOutcome(action: string): AuditOutcome {
   return "SUCCESS";
 }
 
-export async function recordAdminAuditLog(input: RecordAdminAuditInput) {
+export async function recordAdminAuditLog(
+  input: RecordAdminAuditInput,
+  executor: DbClientOrTx = db
+) {
   const now = new Date();
   const timestampIso = now.toISOString();
   const outcome = input.outcome ?? inferDefaultOutcome(input.action);
@@ -114,7 +117,7 @@ export async function recordAdminAuditLog(input: RecordAdminAuditInput) {
     timestampIso,
   });
 
-  const [created] = await db
+  const [created] = await executor
     .insert(adminAuditLogs)
     .values({
       adminUserId: input.adminUserId ?? null,

@@ -263,3 +263,68 @@ export function verifyAuditIntegrityHash(
 
   return { valid: false, keyGeneration: "unverified-historical" };
 }
+
+export interface SignedDocumentAccessPayload {
+  documentId: string;
+  adminId: string;
+  exp: number;
+}
+
+/**
+ * Generates a short-lived HMAC-SHA256 token authorizing time-bounded private
+ * access to a single verification document for a specific authenticated admin.
+ */
+export function createSignedDocumentAccessToken(
+  documentId: string,
+  adminId: string,
+  ttlSeconds = 120
+): string {
+  const exp = Math.floor(Date.now() / 1000) + Math.max(10, Math.min(300, ttlSeconds));
+  const payload = Buffer.from(
+    JSON.stringify({ documentId, adminId, exp }),
+    "utf8"
+  ).toString("base64url");
+  const sig = crypto
+    .createHmac("sha256", getAdminSessionSecretKey())
+    .update(`doc-access:${payload}`)
+    .digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+export function verifySignedDocumentAccessToken(
+  token: string,
+  expectedDocumentId: string,
+  expectedAdminId: string
+): boolean {
+  if (!token || typeof token !== "string") return false;
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, providedSig] = parts;
+  if (!payloadB64 || !providedSig) return false;
+
+  const expectedSig = crypto
+    .createHmac("sha256", getAdminSessionSecretKey())
+    .update(`doc-access:${payloadB64}`)
+    .digest("base64url");
+
+  const a = Buffer.from(providedSig, "utf8");
+  const b = Buffer.from(expectedSig, "utf8");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(payloadB64, "base64url").toString("utf8")
+    ) as Partial<SignedDocumentAccessPayload>;
+    const nowSec = Math.floor(Date.now() / 1000);
+    return (
+      parsed.documentId === expectedDocumentId &&
+      parsed.adminId === expectedAdminId &&
+      typeof parsed.exp === "number" &&
+      parsed.exp > nowSec
+    );
+  } catch {
+    return false;
+  }
+}

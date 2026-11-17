@@ -37,6 +37,13 @@ export const adminAxiosClient = axios.create({
 
 adminAxiosClient.interceptors.request.use(
   (config: InternalAxiosRequestConfig) => {
+    if (
+      typeof FormData !== "undefined" &&
+      config.data instanceof FormData &&
+      config.headers
+    ) {
+      config.headers.delete("Content-Type");
+    }
     const method = (config.method || "get").toUpperCase();
     if (["POST", "PATCH", "PUT", "DELETE"].includes(method)) {
       const csrfToken = getBrowserCookie("ls_admin_csrf");

@@ -423,6 +423,7 @@ export const verificationDocuments = pgTable(
     documentType: varchar("document_type", { length: 100 }).notNull(),
     documentTitle: varchar("document_title", { length: 255 }).notNull(),
     storageReference: varchar("storage_reference", { length: 500 }).notNull(),
+    originalFileName: varchar("original_file_name", { length: 255 }),
     mimeType: varchar("mime_type", { length: 100 })
       .notNull()
       .default("application/pdf"),
@@ -430,7 +431,11 @@ export const verificationDocuments = pgTable(
     checksumSha256: varchar("checksum_sha256", { length: 128 }),
     malwareScanStatus: varchar("malware_scan_status", { length: 50 })
       .notNull()
-      .default("CLEAN"),
+      .default("PENDING"),
+    malwareScanProvider: varchar("malware_scan_provider", { length: 80 }),
+    malwareScannedAt: timestamp("malware_scanned_at", { withTimezone: true }),
+    malwareScanResult: text("malware_scan_result"),
+    quarantinedAt: timestamp("quarantined_at", { withTimezone: true }),
     status: varchar("status", { length: 50 }).notNull().default("SUBMITTED"),
     expiresAt: timestamp("expires_at", { withTimezone: true }),
     uploadedBy: uuid("uploaded_by").references(() => users.id, {
@@ -457,10 +462,23 @@ export const verificationDocuments = pgTable(
     index("verification_documents_center_id_idx").on(t.centerId),
     index("verification_documents_caregiver_id_idx").on(t.caregiverId),
     index("verification_documents_status_idx").on(t.status),
+    index("verification_documents_malware_status_idx").on(t.malwareScanStatus),
     check("verification_documents_size_nonneg", sql`${t.fileSizeBytes} >= 0`),
+    check(
+      "verification_documents_size_max",
+      sql`${t.fileSizeBytes} <= 10485760`
+    ),
     check(
       "verification_documents_status_valid",
       sql`${t.status} IN ('SUBMITTED', 'UNDER_REVIEW', 'VERIFIED', 'REJECTED', 'EXPIRED')`
+    ),
+    check(
+      "verification_documents_malware_status_valid",
+      sql`${t.malwareScanStatus} IN ('PENDING', 'SCANNING', 'CLEAN', 'INFECTED', 'ERROR')`
+    ),
+    check(
+      "verification_documents_category_valid",
+      sql`${t.documentCategory} IN ('PROVIDER', 'CENTER', 'CAREGIVER')`
     ),
   ]
 );

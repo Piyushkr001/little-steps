@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { getTableConfig, PgDialect } from "drizzle-orm/pg-core";
-import { type AppDatabase, setDatabaseInstanceForTests } from "../config/db";
+import {
+  type AppDatabase,
+  DatabaseConfigurationError,
+  resolveDatabaseConnectionString,
+  setDatabaseInstanceForTests,
+} from "../config/db";
 import {
   adminAuditLogs,
   adminOtpChallenges,
@@ -30,12 +35,26 @@ import {
 import {
   type CookieInstruction,
   dispatchAdminApiRequest,
+  handleDocumentContentStreamRequest,
 } from "../server/dispatcher";
 import { setAdminOtpMailInterceptorForTests } from "../server/mail/nodemailer";
 import {
+  checkRateLimit,
+  getActiveKeyLockCountForTests,
   resetAllRateLimitsForTests,
   setRateLimitBackendForTests,
 } from "../server/middleware/rate-limit";
+import {
+  setDocumentScannerForTests,
+} from "../server/services/document-scanner.service";
+import {
+  setDocumentStorageAdapterForTests,
+} from "../server/services/document-storage.service";
+import {
+  inspectHistoricalCleanDocumentsImpact,
+  isCenterScopedDocument,
+  isProviderScopedDocument,
+} from "../server/services/operations.service";
 import {
   ADMIN_CSRF_COOKIE_NAME,
   ADMIN_CSRF_HEADER_NAME,
@@ -275,6 +294,9 @@ function createIsolatedMemoryDatabase() {
           limitCount = n;
           return builder;
         },
+        for() {
+          return builder;
+        },
         then<TResult1 = RowRecord[], TResult2 = never>(
           onfulfilled?:
             | ((value: RowRecord[]) => TResult1 | PromiseLike<TResult1>)
@@ -330,6 +352,7 @@ function createIsolatedMemoryDatabase() {
               consumedAt: item.consumedAt ?? null,
               invalidatedAt: item.invalidatedAt ?? null,
               revokedAt: item.revokedAt ?? null,
+              quarantinedAt: item.quarantinedAt ?? null,
               attempts: item.attempts ?? 0,
               maxAttempts: item.maxAttempts ?? 5,
               resendCount: item.resendCount ?? 0,
@@ -456,6 +479,10 @@ function createIsolatedMemoryDatabase() {
         }
         throw err;
       }
+    },
+
+    async execute() {
+      return { rows: [] };
     },
   };
 
@@ -633,6 +660,15 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
     })
     .returning();
 
+  const TEST_VALID_PDF_BUFFER = Buffer.from(
+    "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "utf8"
+  );
+  const TEST_VALID_PDF_SHA256 = crypto
+    .createHash("sha256")
+    .update(TEST_VALID_PDF_BUFFER)
+    .digest("hex");
+
   const [orgDoc] = await db
     .insert(verificationDocuments)
     .values({
@@ -642,11 +678,14 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
       documentCategory: "PROVIDER",
       documentType: "STATE_CHILDCARE_LICENSE",
       documentTitle: "State Childcare Organization License",
-      storageReference: "s3://private-compliance-bucket/sunshine/state-license.pdf",
+      storageReference: "private://sunshine/state-license.pdf",
+      originalFileName: "state-license.pdf",
       mimeType: "application/pdf",
-      fileSizeBytes: 245_000,
-      checksumSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      fileSizeBytes: TEST_VALID_PDF_BUFFER.byteLength,
+      checksumSha256: TEST_VALID_PDF_SHA256,
       malwareScanStatus: "CLEAN",
+      malwareScanProvider: "clamav",
+      malwareScannedAt: now,
       status: "VERIFIED",
       reviewedBy: superAdmin.id,
       reviewedAt: now,
@@ -712,6 +751,37 @@ async function runPhase1SecurityTestSuite() {
   setDatabaseInstanceForTests(memoryDb);
   setRateLimitBackendForTests("memory-test");
   resetAllRateLimitsForTests();
+
+  const inMemoryDocumentObjects = new Map<string, Buffer>();
+  const samplePdfBytes = Buffer.from(
+    "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+    "utf8"
+  );
+  const samplePdfSha256 = crypto
+    .createHash("sha256")
+    .update(samplePdfBytes)
+    .digest("hex");
+
+  inMemoryDocumentObjects.set("sunshine/state-license.pdf", samplePdfBytes);
+  inMemoryDocumentObjects.set("bright-horizons/license.pdf", samplePdfBytes);
+  inMemoryDocumentObjects.set("bright-horizons/north-fire.pdf", samplePdfBytes);
+  inMemoryDocumentObjects.set("bright-horizons/meera-bg.pdf", samplePdfBytes);
+
+  setDocumentStorageAdapterForTests({
+    async putObject(key, buffer) {
+      inMemoryDocumentObjects.set(key, Buffer.from(buffer));
+    },
+    async getObject(key) {
+      const found = inMemoryDocumentObjects.get(key);
+      if (!found) {
+        throw new Error(`Object missing from test private storage: ${key}`);
+      }
+      return Buffer.from(found);
+    },
+    async deleteObject(key) {
+      inMemoryDocumentObjects.delete(key);
+    },
+  });
 
   const interceptedEmails: Array<{ toEmail: string; otpCode: string }> = [];
   setAdminOtpMailInterceptorForTests((payload) => {
@@ -1290,6 +1360,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "All childcare permits and safety checks verified.",
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: superCookies,
       headers: superHeaders,
@@ -1640,7 +1714,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Attempting approval without documents",
-        checklistState: { licenseVerified: true },
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1659,11 +1736,14 @@ async function runPhase1SecurityTestSuite() {
         documentCategory: "PROVIDER",
         documentType: "STATE_CHILDCARE_LICENSE",
         documentTitle: "Bright Horizons State Childcare License",
-        storageReference: "s3://private-vault/bright-horizons/license.pdf",
+        storageReference: "private://bright-horizons/license.pdf",
+        originalFileName: "license.pdf",
         mimeType: "application/pdf",
-        fileSizeBytes: 312_000,
-        checksumSha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: samplePdfSha256,
         malwareScanStatus: "CLEAN",
+        malwareScanProvider: "clamav",
+        malwareScannedAt: new Date(),
         status: "SUBMITTED",
         expiresAt: new Date(Date.now() + 365 * 86_400_000),
         uploadedBy: p2Owner.id,
@@ -1680,11 +1760,14 @@ async function runPhase1SecurityTestSuite() {
         documentCategory: "CENTER",
         documentType: "FIRE_SAFETY_PERMIT",
         documentTitle: "North Campus Municipal Fire Permit",
-        storageReference: "s3://private-vault/bright-horizons/north-fire.pdf",
+        storageReference: "private://bright-horizons/north-fire.pdf",
+        originalFileName: "north-fire.pdf",
         mimeType: "application/pdf",
-        fileSizeBytes: 198_000,
-        checksumSha256: "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: samplePdfSha256,
         malwareScanStatus: "CLEAN",
+        malwareScanProvider: "clamav",
+        malwareScannedAt: new Date(),
         status: "SUBMITTED",
         expiresAt: new Date(Date.now() + 365 * 86_400_000),
         uploadedBy: p2Owner.id,
@@ -1698,7 +1781,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Attempting approval while org doc is still SUBMITTED",
-        checklistState: { licenseVerified: true },
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1735,6 +1821,7 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewNotes: "Verified state license number against state registry.",
+        evidenceReviewed: true,
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1750,7 +1837,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Checklist incomplete test",
-        checklistState: { licenseVerified: false },
+        checklistState: {
+          licenseVerified: false,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1770,7 +1860,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Attempting self-approval",
-        checklistState: { licenseVerified: true },
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1791,7 +1884,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Organization license and registration independently verified.",
-        checklistState: { licenseVerified: true },
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1866,7 +1962,8 @@ async function runPhase1SecurityTestSuite() {
     assert.equal(listDocsRes.status, 200);
     const serializedDocs = JSON.stringify(listDocsRes.body);
     assert.equal(
-      serializedDocs.includes("s3://private-vault"),
+      serializedDocs.includes("s3://private-vault") ||
+        serializedDocs.includes("private://bright-horizons"),
       false,
       "Raw private storageReference must never be exposed in API responses"
     );
@@ -1883,6 +1980,8 @@ async function runPhase1SecurityTestSuite() {
           facilitySafetyVerified: true,
           caregiverQualificationVerified: true,
           capacityVerified: true,
+          operatingHoursVerified: true,
+          ageGroupsVerified: true,
         },
       },
       cookies: p2Cookies,
@@ -1899,6 +1998,7 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewNotes: "Verified municipal fire permit for North Campus.",
+        evidenceReviewed: true,
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1919,6 +2019,8 @@ async function runPhase1SecurityTestSuite() {
           facilitySafetyVerified: true,
           caregiverQualificationVerified: true,
           capacityVerified: true,
+          operatingHoursVerified: true,
+          ageGroupsVerified: true,
         },
       },
       cookies: p2Cookies,
@@ -1935,6 +2037,10 @@ async function runPhase1SecurityTestSuite() {
       query: {},
       body: {
         reviewComments: "Attempting caregiver verification without screening document",
+        checklistState: {
+          backgroundScreeningVerified: true,
+          credentialsVerified: true,
+        },
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1953,11 +2059,14 @@ async function runPhase1SecurityTestSuite() {
         documentCategory: "CAREGIVER",
         documentType: "BACKGROUND_CHECK_CLEARANCE",
         documentTitle: "Meera Nair National Criminal & Childcare Background Clearance",
-        storageReference: "s3://private-vault/bright-horizons/meera-bg.pdf",
+        storageReference: "private://bright-horizons/meera-bg.pdf",
+        originalFileName: "meera-bg.pdf",
         mimeType: "application/pdf",
-        fileSizeBytes: 154_000,
-        checksumSha256: "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: samplePdfSha256,
         malwareScanStatus: "CLEAN",
+        malwareScanProvider: "clamav",
+        malwareScannedAt: new Date(),
         status: "VERIFIED",
         reviewedBy: fixtures.standardAdmin.id,
         reviewedAt: new Date(),
@@ -2004,6 +2113,8 @@ async function runPhase1SecurityTestSuite() {
           facilitySafetyVerified: true,
           caregiverQualificationVerified: true,
           capacityVerified: true,
+          operatingHoursVerified: true,
+          ageGroupsVerified: true,
         },
       },
       cookies: p2Cookies,
@@ -2034,6 +2145,8 @@ async function runPhase1SecurityTestSuite() {
           facilitySafetyVerified: true,
           caregiverQualificationVerified: true,
           capacityVerified: true,
+          operatingHoursVerified: true,
+          ageGroupsVerified: true,
         },
       },
       cookies: p2Cookies,
@@ -2123,6 +2236,8 @@ async function runPhase1SecurityTestSuite() {
           facilitySafetyVerified: true,
           caregiverQualificationVerified: true,
           capacityVerified: true,
+          operatingHoursVerified: true,
+          ageGroupsVerified: true,
         },
       },
       cookies: p2Cookies,
@@ -2178,16 +2293,912 @@ async function runPhase1SecurityTestSuite() {
       "    [PASS] Atomic transaction rollback, 409 conflict detection, and review history consistency verified."
     );
 
+    // ========================================================================
+    // PART G: Phase 2.1 Document Security, Evidence Scoping & Hardening Tests
+    // ========================================================================
+    console.log(
+      "G1. Testing Phase 2.1 Malware Scan Defaults, Constraints & Database Config..."
+    );
+
+    // 1. Default malwareScanStatus MUST be PENDING (never SAFE/CLEAN)
+    assert.equal(
+      verificationDocuments.malwareScanStatus.default,
+      "PENDING",
+      "verificationDocuments.malwareScanStatus must default to PENDING"
+    );
+
+    // 2. Phase 2.1 CHECK constraints on verification_documents
+    const p21DocCheckNames = getTableConfig(verificationDocuments).checks.map(
+      (c) => c.name
+    );
+    assert.ok(p21DocCheckNames.includes("verification_documents_size_max"));
+    assert.ok(
+      p21DocCheckNames.includes("verification_documents_malware_status_valid")
+    );
+    assert.ok(
+      p21DocCheckNames.includes("verification_documents_category_valid")
+    );
+
+    // 3. No hardcoded DB fallback & prod/test separation
+    assert.throws(
+      () =>
+        resolveDatabaseConnectionString({
+          NODE_ENV: "development",
+        } as unknown as NodeJS.ProcessEnv),
+      DatabaseConfigurationError,
+      "Missing DATABASE_URL must fail loudly without hardcoded fallback"
+    );
+    assert.throws(
+      () =>
+        resolveDatabaseConnectionString({
+          NODE_ENV: "production",
+          DATABASE_URL: "postgresql://user:pass@ep.neon.tech/prod",
+          TEST_DATABASE_URL: "postgresql://user:pass@ep.neon.tech/prod",
+        } as unknown as NodeJS.ProcessEnv),
+      DatabaseConfigurationError,
+      "Production must reject matching TEST_DATABASE_URL"
+    );
+    assert.throws(
+      () =>
+        resolveDatabaseConnectionString({
+          NODE_ENV: "test",
+          DATABASE_URL: "postgresql://user:pass@ep.neon.tech/prod",
+        } as unknown as NodeJS.ProcessEnv),
+      DatabaseConfigurationError,
+      "Test mode must require dedicated TEST_DATABASE_URL instead of DATABASE_URL"
+    );
+
+    console.log(
+      "    [PASS] Phase 2.1 defaults, document constraints, and DB URL guards verified."
+    );
+
+    console.log(
+      "G2. Testing Private Document Upload, Malware Scanning, Quarantine & Content Access Control..."
+    );
+
+    // Clear CLAMAV env vars to ensure fail-safe PENDING behavior when unconfigured
+    const origClamHost = process.env.CLAMAV_HOST;
+    delete process.env.CLAMAV_HOST;
+    setDocumentScannerForTests(null);
+
+    // Authenticate a distinct independent reviewer admin (superAdmin) so uploader vs reviewer separation of duties is enforced
+    resetAllRateLimitsForTests();
+    await memoryDb
+      .update(adminOtpChallenges)
+      .set({ invalidatedAt: new Date() })
+      .where(undefined);
+    const revOtpReq = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "request-otp"],
+      query: {},
+      body: { email: fixtures.superAdmin.email },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(revOtpReq.status, 200);
+    const revOtpCode = interceptedEmails.at(-1)!.otpCode;
+    const revVerifyRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "verify-otp"],
+      query: {},
+      body: { email: fixtures.superAdmin.email, otp: revOtpCode },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(revVerifyRes.status, 200);
+    const reviewerCookies = Object.fromEntries(
+      (revVerifyRes.cookiesToSet ?? []).map((c: CookieInstruction) => [
+        c.name,
+        c.value,
+      ])
+    );
+    const reviewerHeaders = {
+      [ADMIN_CSRF_HEADER_NAME]: reviewerCookies[ADMIN_CSRF_COOKIE_NAME],
+      host: "localhost:3000",
+      origin: "http://localhost:3000",
+    };
+
+    // 1. Forged MIME/magic signature rejected (executable bytes claiming PDF)
+    const exePayload = Buffer.from("MZ\x90\x00\x03\x00\x00\x00fake-exe", "binary");
+    const forgedUploadRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", "upload"],
+      query: {},
+      body: {
+        providerId: p2Provider.id,
+        centerId: null,
+        caregiverId: null,
+        documentCategory: "PROVIDER",
+        documentType: "TAX_COMPLIANCE_CERT",
+        documentTitle: "Spoofed Executable",
+        fileName: "malware.pdf",
+        mimeType: "application/pdf",
+        fileBase64: exePayload.toString("base64"),
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(forgedUploadRes.status, 400);
+
+    // 2. Valid PDF upload succeeds into private storage with PENDING status (never auto-CLEAN)
+    const uploadPendingRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", "upload"],
+      query: {},
+      body: {
+        providerId: p2Provider.id,
+        centerId: null,
+        caregiverId: null,
+        documentCategory: "PROVIDER",
+        documentType: "INSURANCE_CERTIFICATE",
+        documentTitle: "Liability Insurance Certificate 2026",
+        fileName: "../etc/passwd/insurance-2026.pdf",
+        mimeType: "application/pdf",
+        fileBase64: samplePdfBytes.toString("base64"),
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(uploadPendingRes.status, 201);
+    const pendingDocId = (
+      uploadPendingRes.body.data as {
+        documentId: string;
+        malwareScanStatus: string;
+      }
+    ).documentId;
+    assert.equal(
+      (uploadPendingRes.body.data as { malwareScanStatus: string })
+        .malwareScanStatus,
+      "PENDING",
+      "Unconfigured malware scanner must keep uploaded documents PENDING, never CLEAN"
+    );
+
+    // 3a. Uploader cannot self-verify their own uploaded document (403)
+    const failSelfVerifyDoc = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting self-approval of uploaded doc",
+        evidenceReviewed: true,
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failSelfVerifyDoc.status, 403);
+
+    // 3b. Independent reviewer cannot approve PENDING/unscanned document (400) & strict schema rejects forged fields / missing evidenceReviewed
+    const failApprovePending = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting approval before malware scan",
+        evidenceReviewed: true,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failApprovePending.status, 400);
+
+    const failMissingEvidenceFlag = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Missing inspection checkbox",
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failMissingEvidenceFlag.status, 400);
+
+    const failForgedScanField = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting client spoof of malwareScanStatus",
+        evidenceReviewed: true,
+        malwareScanStatus: "CLEAN",
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failForgedScanField.status, 400);
+
+    // 4. Content streaming blocked while PENDING
+    const failStreamPending = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", pendingDocId, "content"],
+        query: {},
+        body: undefined,
+        cookies: reviewerCookies,
+        headers: {},
+        ipAddress: "10.30.0.2",
+        userAgent: "Phase21Test/1.0",
+      },
+      pendingDocId
+    );
+    assert.equal(failStreamPending.ok, false);
+    if (!failStreamPending.ok) {
+      assert.equal(failStreamPending.response.status, 403);
+    }
+
+    // 5. Infected document scan -> quarantines, rejects, blocks rescan, blocks approval, blocks content access
+    const uploadInfectedRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", "upload"],
+      query: {},
+      body: {
+        providerId: p2Provider.id,
+        centerId: p2CenterB.id,
+        caregiverId: null,
+        documentCategory: "CENTER",
+        documentType: "HEALTH_INSPECTION",
+        documentTitle: "Infected Health Attachment",
+        fileName: "eicar-test.pdf",
+        mimeType: "application/pdf",
+        fileBase64: samplePdfBytes.toString("base64"),
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(uploadInfectedRes.status, 201);
+    const infectedDocId = (
+      uploadInfectedRes.body.data as { documentId: string }
+    ).documentId;
+
+    setDocumentScannerForTests(async () => ({
+      status: "INFECTED",
+      provider: "clamav-test",
+      scannedAt: new Date(),
+      resultMessage: "Eicar-Test-Signature FOUND",
+      configured: true,
+    }));
+
+    const infectedScanRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", infectedDocId, "scan"],
+      query: {},
+      body: {},
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(infectedScanRes.status, 200);
+    assert.equal(
+      (infectedScanRes.body.data as { malwareScanStatus: string })
+        .malwareScanStatus,
+      "INFECTED"
+    );
+
+    const failRescanInfected = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", infectedDocId, "scan"],
+      query: {},
+      body: {},
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failRescanInfected.status, 403);
+
+    const failApproveInfected = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", infectedDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting infected approval",
+        evidenceReviewed: true,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failApproveInfected.status, 400);
+
+    const failStreamInfected = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", infectedDocId, "content"],
+        query: {},
+        body: undefined,
+        cookies: reviewerCookies,
+        headers: {},
+        ipAddress: "10.30.0.2",
+        userAgent: "Phase21Test/1.0",
+      },
+      infectedDocId
+    );
+    assert.equal(failStreamInfected.ok, false);
+    if (!failStreamInfected.ok) {
+      assert.equal(failStreamInfected.response.status, 403);
+    }
+
+    // 6. Clean scan -> signed preview URL -> authenticated streaming & audit logging -> approval succeeds
+    setDocumentScannerForTests(async () => ({
+      status: "CLEAN",
+      provider: "clamav-test",
+      scannedAt: new Date(),
+      resultMessage: "stream: OK",
+      configured: true,
+    }));
+
+    const cleanScanRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "scan"],
+      query: {},
+      body: {},
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(cleanScanRes.status, 200);
+    assert.equal(
+      (cleanScanRes.body.data as { malwareScanStatus: string })
+        .malwareScanStatus,
+      "CLEAN"
+    );
+
+    const inspectedRes = await dispatchAdminApiRequest({
+      method: "GET",
+      segments: ["verification-documents", pendingDocId],
+      query: {},
+      body: undefined,
+      cookies: reviewerCookies,
+      headers: {},
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(inspectedRes.status, 200);
+    const signedAccessUrl = (
+      inspectedRes.body.data as { signedAccessUrl: string | null }
+    ).signedAccessUrl;
+    assert.ok(
+      signedAccessUrl && signedAccessUrl.includes("token="),
+      "GET /verification-documents/:id must mint a signedAccessUrl for CLEAN documents"
+    );
+    assert.equal(
+      JSON.stringify(inspectedRes.body).includes("private://"),
+      false,
+      "GET /verification-documents/:id must never leak storageReference"
+    );
+
+    const parsedToken = new URL(
+      `http://localhost:3000${signedAccessUrl}`
+    ).searchParams.get("token")!;
+
+    // Unauthenticated access blocked (401)
+    const unauthStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", pendingDocId, "content"],
+        query: { token: parsedToken },
+        body: undefined,
+        cookies: {},
+        headers: {},
+        ipAddress: "10.30.0.2",
+        userAgent: "Phase21Test/1.0",
+      },
+      pendingDocId
+    );
+    assert.equal(unauthStream.ok, false);
+    if (!unauthStream.ok) assert.equal(unauthStream.response.status, 401);
+
+    // Different admin trying to replay reviewerCookies's signed token fails (403)
+    const wrongAdminTokenStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", pendingDocId, "content"],
+        query: { token: parsedToken },
+        body: undefined,
+        cookies: p2Cookies,
+        headers: {},
+        ipAddress: "10.30.0.1",
+        userAgent: "Phase21Test/1.0",
+      },
+      pendingDocId
+    );
+    assert.equal(wrongAdminTokenStream.ok, false);
+    if (!wrongAdminTokenStream.ok) {
+      assert.equal(wrongAdminTokenStream.response.status, 403);
+    }
+
+    // Cross-provider ownership check fails (403)
+    const crossProviderStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", pendingDocId, "content"],
+        query: { token: parsedToken, providerId: fixtures.provider.id },
+        body: undefined,
+        cookies: reviewerCookies,
+        headers: {},
+        ipAddress: "10.30.0.2",
+        userAgent: "Phase21Test/1.0",
+      },
+      pendingDocId
+    );
+    assert.equal(crossProviderStream.ok, false);
+    if (!crossProviderStream.ok) {
+      assert.equal(crossProviderStream.response.status, 403);
+    }
+
+    // Legitimate authenticated stream succeeds with strict security headers & audit log
+    const validStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", pendingDocId, "content"],
+        query: { token: parsedToken },
+        body: undefined,
+        cookies: reviewerCookies,
+        headers: {},
+        ipAddress: "10.30.0.2",
+        userAgent: "Phase21Test/1.0",
+      },
+      pendingDocId
+    );
+    assert.equal(validStream.ok, true);
+    if (validStream.ok) {
+      assert.equal(validStream.buffer.equals(samplePdfBytes), true);
+      assert.equal(validStream.headers["X-Content-Type-Options"], "nosniff");
+      assert.equal(
+        validStream.headers["Content-Security-Policy"],
+        "default-src 'none'; sandbox"
+      );
+      assert.ok(validStream.headers["Cache-Control"].includes("no-store"));
+    }
+
+    // Approve cleanly after inspection
+    const approvePendingRes = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", pendingDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Inspected private PDF stream and verified CLEAN certificate.",
+        evidenceReviewed: true,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(approvePendingRes.status, 200);
+
+    // 7. Missing or tampered private storage object blocks approval
+    const missingStorageUpload = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", "upload"],
+      query: {},
+      body: {
+        providerId: p2Provider.id,
+        centerId: null,
+        caregiverId: null,
+        documentCategory: "PROVIDER",
+        documentType: "BOARD_RESOLUTION",
+        documentTitle: "Disappearing Evidence Doc",
+        fileName: "vanish.pdf",
+        mimeType: "application/pdf",
+        fileBase64: samplePdfBytes.toString("base64"),
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(missingStorageUpload.status, 201);
+    const vanishDocId = (
+      missingStorageUpload.body.data as { documentId: string }
+    ).documentId;
+    await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", vanishDocId, "scan"],
+      query: {},
+      body: {},
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    // Wipe backing private object before approval
+    inMemoryDocumentObjects.clear();
+    const failMissingContent = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", vanishDocId, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Should fail because stored bytes vanished",
+        evidenceReviewed: true,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.30.0.2",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failMissingContent.status, 400);
+
+    // 8. Historical unscanned CLEAN diagnostic report is strictly read-only
+    const legacyImpact = await inspectHistoricalCleanDocumentsImpact();
+    assert.equal(typeof legacyImpact.totalDocuments, "number");
+    assert.equal(typeof legacyImpact.quarantinedCount, "number");
+    assert.ok(legacyImpact.quarantinedCount >= 1);
+
+    if (origClamHost !== undefined) process.env.CLAMAV_HOST = origClamHost;
+
+    console.log(
+      "    [PASS] Document upload, MIME sniffing, malware quarantine, signed preview, streaming & approval guards verified."
+    );
+
+    console.log(
+      "G3. Testing Strict Evidence Scoping & Mandatory Checklist Enforcement..."
+    );
+
+    // Create provider with ONLY a verified/CLEAN centre document (no organization PROVIDER doc)
+    const [scopedOwner] = await memoryDb
+      .insert(users)
+      .values({
+        email: "scoped.owner@example.com",
+        name: "Scoped Owner",
+        role: "PROVIDER",
+        status: "ACTIVE",
+      })
+      .returning();
+    const [scopedProv] = await memoryDb
+      .insert(providers)
+      .values({
+        ownerUserId: scopedOwner.id,
+        organizationName: "Scoped Childcare Org",
+        registrationNumber: "REG-SCOPED-1",
+        contactEmail: "scoped@example.com",
+        contactPhone: "555-0900",
+        address: "1 Scope St",
+        city: "Austin",
+        state: "TX",
+        postalCode: "78702",
+        verificationStatus: "PENDING",
+        subscriptionActive: true,
+        isPublished: false,
+      })
+      .returning();
+    const [scopedCenter] = await memoryDb
+      .insert(centers)
+      .values({
+        providerId: scopedProv.id,
+        name: "Scoped Campus",
+        slug: "scoped-campus",
+        address: "1 Scope St",
+        city: "Austin",
+        state: "TX",
+        postalCode: "78702",
+        phone: "555-0901",
+        email: "campus@example.com",
+        approvedCapacity: 12,
+        ageGroupsSupported: ["Infant"],
+        operatingHours: { mon: { open: "08:00", close: "18:00" } },
+      })
+      .returning();
+    await memoryDb.insert(verificationDocuments).values({
+      providerId: scopedProv.id,
+      centerId: scopedCenter.id,
+      caregiverId: null,
+      documentCategory: "CENTER",
+      documentType: "FIRE_SAFETY_PERMIT",
+      documentTitle: "Center-only Fire Permit",
+      storageReference: "private://scoped/fire.pdf",
+      originalFileName: "fire.pdf",
+      mimeType: "application/pdf",
+      fileSizeBytes: samplePdfBytes.byteLength,
+      checksumSha256: samplePdfSha256,
+      malwareScanStatus: "CLEAN",
+      malwareScanProvider: "clamav",
+      malwareScannedAt: new Date(),
+      status: "VERIFIED",
+      reviewedBy: fixtures.standardAdmin.id,
+      reviewedAt: new Date(),
+      expiresAt: new Date(Date.now() + 365 * 86_400_000),
+      uploadedBy: scopedOwner.id,
+    });
+    const [scopedVerif] = await memoryDb
+      .insert(providerVerifications)
+      .values({
+        providerId: scopedProv.id,
+        status: "PENDING",
+        submittedAt: new Date(),
+        documentReferences: [],
+        checklistState: {},
+      })
+      .returning();
+
+    const failOrgWithOnlyCenterDoc = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verifications", scopedVerif.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Attempting org approval with center doc only",
+        checklistState: {
+          licenseVerified: true,
+          organizationDetailsVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(
+      failOrgWithOnlyCenterDoc.status,
+      400,
+      "Centre-scoped document must NEVER satisfy organization-level provider approval"
+    );
+
+    assert.equal(
+      isProviderScopedDocument({
+        centerId: scopedCenter.id,
+        caregiverId: null,
+        documentCategory: "CENTER",
+      }),
+      false
+    );
+    assert.equal(
+      isCenterScopedDocument(
+        {
+          providerId: fixtures.provider.id,
+          centerId: scopedCenter.id,
+          caregiverId: null,
+          documentCategory: "CENTER",
+        },
+        scopedCenter.id,
+        scopedProv.id
+      ),
+      false
+    );
+
+    // Incomplete center checklist rejected by strict validation
+    const failIncompleteCenterChecklist = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["center-verifications", scopedCenter.id, "approve"],
+      query: {},
+      body: {
+        reviewComments: "Incomplete 4-key checklist",
+        checklistState: {
+          operatingLicenseVerified: true,
+          facilitySafetyVerified: true,
+          caregiverQualificationVerified: true,
+          capacityVerified: true,
+        },
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failIncompleteCenterChecklist.status, 400);
+
+    console.log(
+      "    [PASS] Strict document ownership scoping and mandatory complete checklists verified."
+    );
+
+    console.log(
+      "G4. Testing Atomic OTP Login Rollback & Audit Transaction Atomicity..."
+    );
+
+    // Expire cooldown/challenges for standardAdmin and request fresh OTP
+    resetAllRateLimitsForTests();
+    await memoryDb
+      .update(adminOtpChallenges)
+      .set({ invalidatedAt: new Date() })
+      .where(undefined);
+
+    const txOtpReq = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "request-otp"],
+      query: {},
+      body: { email: "admin@littlesteps.com" },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.99",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(txOtpReq.status, 200);
+    const txOtpCode = interceptedEmails.at(-1)!.otpCode;
+
+    // Count existing ADMIN_LOGIN_SUCCESS audit logs before failure
+    const logsBeforeOtpFail = (
+      await memoryDb.select().from(adminAuditLogs)
+    ).filter((l) => l.action === "ADMIN_LOGIN_SUCCESS").length;
+
+    // Inject failure into adminSessions insert during OTP verify
+    setFailNextInsertOnTable(adminSessions);
+    const failedOtpVerify = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "verify-otp"],
+      query: {},
+      body: { email: "admin@littlesteps.com", otp: txOtpCode },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.99",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(failedOtpVerify.status, 500);
+
+    const logsAfterOtpFail = (
+      await memoryDb.select().from(adminAuditLogs)
+    ).filter((l) => l.action === "ADMIN_LOGIN_SUCCESS").length;
+    assert.equal(
+      logsAfterOtpFail,
+      logsBeforeOtpFail,
+      "Failed login transaction must roll back ADMIN_LOGIN_SUCCESS audit log"
+    );
+
+    // Retrying with the SAME valid OTP succeeds because consumedAt was rolled back!
+    const recoveredOtpVerify = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "verify-otp"],
+      query: {},
+      body: { email: "admin@littlesteps.com", otp: txOtpCode },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.30.0.99",
+      userAgent: "Phase21Test/1.0",
+    });
+    assert.equal(
+      recoveredOtpVerify.status,
+      200,
+      "Rolled-back OTP consumption must allow legitimate retry once DB recovers"
+    );
+
+    console.log(
+      "    [PASS] Atomic OTP consumption + session + audit rollback verified."
+    );
+
+    console.log(
+      "G5. Testing Rate Limiter Lock Cleanup, Single-Call Redis Lua EVAL & SQL Upsert..."
+    );
+
+    // Concurrent memory rate limit burst leaves zero dangling key locks
+    resetAllRateLimitsForTests();
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        checkRateLimit(`burst:ip-${i % 4}`, 10, 60_000)
+      )
+    );
+    assert.equal(
+      getActiveKeyLockCountForTests(),
+      0,
+      "withKeyLock must clean up all promise entries after concurrent completions"
+    );
+
+    // Atomic Redis Lua EVAL + Production fail-closed check
+    const origFetch = globalThis.fetch;
+    const origUpstashUrl = process.env.UPSTASH_REDIS_REST_URL;
+    const origUpstashToken = process.env.UPSTASH_REDIS_REST_TOKEN;
+    const mutableEnv = process.env as Record<string, string | undefined>;
+    const origNodeEnv = mutableEnv.NODE_ENV;
+    let redisEvalRequests = 0;
+
+    try {
+      setRateLimitBackendForTests("redis");
+      process.env.UPSTASH_REDIS_REST_URL = "https://mock-upstash.example.com";
+      process.env.UPSTASH_REDIS_REST_TOKEN = "mock-token";
+
+      globalThis.fetch = (async (_input, init) => {
+        redisEvalRequests += 1;
+        const body = JSON.parse(String(init?.body ?? "[]")) as string[];
+        assert.equal(
+          body[0],
+          "EVAL",
+          "Redis rate limiter must issue a single atomic EVAL Lua script call"
+        );
+        assert.ok(body[1].includes("PEXPIRE"));
+        return new Response(JSON.stringify({ result: [1, 60_000] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }) as typeof fetch;
+
+      const redisOk = await checkRateLimit("redis-test:1", 5, 60_000);
+      assert.equal(redisOk.allowed, true);
+      assert.equal(redisEvalRequests, 1);
+
+      // Simulate Redis outage under production -> MUST fail closed (allowed: false)
+      mutableEnv.NODE_ENV = "production";
+      globalThis.fetch = (async () =>
+        new Response("Redis Down", { status: 503 })) as typeof fetch;
+      const redisFailClosed = await checkRateLimit("redis-test:2", 5, 60_000);
+      assert.equal(
+        redisFailClosed.allowed,
+        false,
+        "Production rate limiter must fail closed when Redis is unavailable"
+      );
+    } finally {
+      mutableEnv.NODE_ENV = origNodeEnv;
+      globalThis.fetch = origFetch;
+      if (origUpstashUrl !== undefined) {
+        process.env.UPSTASH_REDIS_REST_URL = origUpstashUrl;
+      } else {
+        delete process.env.UPSTASH_REDIS_REST_URL;
+      }
+      if (origUpstashToken !== undefined) {
+        process.env.UPSTASH_REDIS_REST_TOKEN = origUpstashToken;
+      } else {
+        delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      }
+      setRateLimitBackendForTests("database");
+    }
+
+    // Atomic SQL upsert path check (`db.execute` called once per rate-limit check)
+    let pgUpsertCalls = 0;
+    let pgCounter = 0;
+    try {
+      delete process.env.UPSTASH_REDIS_REST_URL;
+      delete process.env.UPSTASH_REDIS_REST_TOKEN;
+      setDatabaseInstanceForTests({
+        execute: async () => {
+          pgUpsertCalls += 1;
+          pgCounter += 1;
+          return {
+            rows: [
+              {
+                setting_value: {
+                  count: pgCounter,
+                  resetAt: Date.now() + 60_000,
+                },
+              },
+            ],
+          };
+        },
+      } as unknown as AppDatabase);
+
+      const pgRes1 = await checkRateLimit("sql-atomic:1", 1, 60_000);
+      const pgRes2 = await checkRateLimit("sql-atomic:1", 1, 60_000);
+      assert.equal(pgRes1.allowed, true);
+      assert.equal(pgRes2.allowed, false);
+      assert.equal(pgUpsertCalls, 2);
+    } finally {
+      setDatabaseInstanceForTests(memoryDb);
+      setRateLimitBackendForTests("memory-test");
+      resetAllRateLimitsForTests();
+    }
+
+    console.log(
+      "    [PASS] Rate limiter lock cleanup, atomic Redis EVAL, prod fail-closed, and SQL upsert verified."
+    );
+
     console.log(
       "=================================================================="
     );
     console.log(
-      "ALL PHASE 1 & PHASE 2 TESTS PASSED (100% ISOLATED)!"
+      "ALL PHASE 1, PHASE 2 & PHASE 2.1 TESTS PASSED (100% ISOLATED)!"
     );
     console.log(
       "=================================================================="
     );
   } finally {
+    setDocumentScannerForTests(null);
+    setDocumentStorageAdapterForTests(null);
     setAdminOtpMailInterceptorForTests(null);
     setRateLimitBackendForTests(null);
     setDatabaseInstanceForTests(null);

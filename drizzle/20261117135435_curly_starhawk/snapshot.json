@@ -1,0 +1,339 @@
+{
+  "type": "diff",
+  "version": "9",
+  "dialect": "postgres",
+  "id": "7114ba91-4fd3-4603-b43c-a4fa74280a9d",
+  "prevIds": [
+    "d6ee321a-823d-4896-bede-bac5f3e9b573"
+  ],
+  "footprints": [
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "original_file_name"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.original_file_name",
+        "n|col|public.verification_documents.original_file_name",
+        "e|col|public.verification_documents.original_file_name"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "malware_scan_provider"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.malware_scan_provider",
+        "n|col|public.verification_documents.malware_scan_provider",
+        "e|col|public.verification_documents.malware_scan_provider"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "malware_scanned_at"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.malware_scanned_at",
+        "n|col|public.verification_documents.malware_scanned_at",
+        "e|col|public.verification_documents.malware_scanned_at"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "malware_scan_result"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.malware_scan_result",
+        "n|col|public.verification_documents.malware_scan_result",
+        "e|col|public.verification_documents.malware_scan_result"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "add_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "quarantined_at"
+      ],
+      "writes": [
+        "s|col|public.verification_documents.quarantined_at",
+        "n|col|public.verification_documents.quarantined_at",
+        "e|col|public.verification_documents.quarantined_at"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public"
+      ]
+    },
+    {
+      "statementType": "alter_column",
+      "statementTarget": [
+        "column",
+        "public",
+        "verification_documents",
+        "malware_scan_status"
+      ],
+      "writes": [
+        "s|colprop|public.verification_documents.malware_scan_status.default"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.malware_scan_status"
+      ],
+      "sqlHash": "89b1d4ff5821acd6"
+    },
+    {
+      "statementType": "create_index",
+      "statementTarget": [
+        "index",
+        "public",
+        "verification_documents",
+        "verification_documents_malware_status_idx"
+      ],
+      "writes": [
+        "s|idx|public.verification_documents_malware_status_idx",
+        "n|idx|public.verification_documents_malware_status_idx",
+        "e|idx|public.verification_documents_malware_status_idx",
+        "n|rel|public.verification_documents_malware_status_idx"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.malware_scan_status"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|ck|public.verification_documents.verification_documents_size_max",
+        "n|ck|public.verification_documents.verification_documents_size_max",
+        "e|ck|public.verification_documents.verification_documents_size_max",
+        "n|con|public.verification_documents.verification_documents_size_max"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.file_size_bytes"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|ck|public.verification_documents.verification_documents_malware_status_valid",
+        "n|ck|public.verification_documents.verification_documents_malware_status_valid",
+        "e|ck|public.verification_documents.verification_documents_malware_status_valid",
+        "n|con|public.verification_documents.verification_documents_malware_status_valid"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.malware_scan_status"
+      ]
+    },
+    {
+      "statementType": "add_check",
+      "statementTarget": [
+        "table",
+        "public",
+        "verification_documents"
+      ],
+      "writes": [
+        "s|ck|public.verification_documents.verification_documents_category_valid",
+        "n|ck|public.verification_documents.verification_documents_category_valid",
+        "e|ck|public.verification_documents.verification_documents_category_valid",
+        "n|con|public.verification_documents.verification_documents_category_valid"
+      ],
+      "reads": [
+        "n|tbl|public.verification_documents",
+        "n|sch|public",
+        "n|col|public.verification_documents.document_category"
+      ]
+    }
+  ],
+  "deltas": [
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "original_file_name",
+        "type": "varchar(255)",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "malware_scan_provider",
+        "type": "varchar(80)",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "malware_scanned_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "malware_scan_result",
+        "type": "text",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "quarantined_at",
+        "type": "timestamp with time zone",
+        "typeSchema": null,
+        "notNull": false,
+        "dimensions": 0,
+        "default": null,
+        "generated": null,
+        "identity": null,
+        "entityType": "columns"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_malware_status_idx",
+        "nameExplicit": true,
+        "columns": [
+          {
+            "value": "malware_scan_status",
+            "isExpression": false,
+            "asc": true,
+            "nullsFirst": false,
+            "opclass": null
+          }
+        ],
+        "isUnique": false,
+        "where": null,
+        "with": "",
+        "method": "btree",
+        "concurrently": false,
+        "entityType": "indexes"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_size_max",
+        "value": "\"file_size_bytes\" <= 10485760",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_malware_status_valid",
+        "value": "\"malware_scan_status\" IN ('PENDING', 'SCANNING', 'CLEAN', 'INFECTED', 'ERROR')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "create",
+      "row": {
+        "schema": "public",
+        "table": "verification_documents",
+        "name": "verification_documents_category_valid",
+        "value": "\"document_category\" IN ('PROVIDER', 'CENTER', 'CAREGIVER')",
+        "entityType": "checks"
+      }
+    },
+    {
+      "op": "alter",
+      "key": "columns\u0000[\"public\",\"verification_documents\",\"malware_scan_status\"]",
+      "set": {
+        "default": "'PENDING'"
+      }
+    }
+  ]
+}

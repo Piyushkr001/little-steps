@@ -42,6 +42,15 @@ export type DocumentVerificationStatus =
   | "REJECTED"
   | "EXPIRED";
 
+export type MalwareScanStatus =
+  | "PENDING"
+  | "SCANNING"
+  | "CLEAN"
+  | "INFECTED"
+  | "ERROR";
+
+export type DocumentScopeCategory = "PROVIDER" | "CENTER" | "CAREGIVER";
+
 export type BookingPaymentStatus =
   | "UNPAID"
   | "PENDING"

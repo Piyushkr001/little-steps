@@ -1,5 +1,5 @@
 import { and, desc, eq, gt, isNull, lt, sql } from "drizzle-orm";
-import { db } from "../../config/db";
+import { db, type DbClientOrTx } from "../../config/db";
 import {
   adminOtpChallenges,
   adminProfiles,
@@ -64,7 +64,8 @@ export async function verifyAdminEligibilityByEmail(
     ipAddress?: string;
     userAgent?: string;
     recordRejectionAudit?: boolean;
-  }
+  },
+  executor: DbClientOrTx = db
 ): Promise<EligibleAdminRecord> {
   const email = rawEmail.trim().toLowerCase();
 
@@ -101,7 +102,7 @@ export async function verifyAdminEligibilityByEmail(
     return rejectEligibility("MISSING_ADMIN_EMAIL_KEYWORD");
   }
 
-  const [userRecord] = await db
+  const [userRecord] = await executor
     .select()
     .from(users)
     .where(eq(users.email, email))
@@ -128,7 +129,7 @@ export async function verifyAdminEligibilityByEmail(
     );
   }
 
-  const activeRoles = await db
+  const activeRoles = await executor
     .select()
     .from(userRoles)
     .where(
@@ -144,7 +145,7 @@ export async function verifyAdminEligibilityByEmail(
   }
 
   // Requirement 2b: Explicit approved admin_profiles entry
-  const [profileRecord] = await db
+  const [profileRecord] = await executor
     .select()
     .from(adminProfiles)
     .where(eq(adminProfiles.userId, userRecord.id))
@@ -206,43 +207,46 @@ export async function issueAdminOtpChallenge(params: {
     );
   }
 
-  // Invalidate all previous unconsumed OTP challenges for this administrator before issuing a replacement
-  await db
-    .update(adminOtpChallenges)
-    .set({ invalidatedAt: now })
-    .where(
-      and(
-        eq(adminOtpChallenges.userId, user.id),
-        isNull(adminOtpChallenges.consumedAt),
-        isNull(adminOtpChallenges.invalidatedAt)
-      )
-    );
-
-  // Always generate a cryptographically random 6-digit OTP (no demo or fixed OTPs)
   const rawOtp = generateNumericOtp();
   const otpHash = hashOtp(user.email, rawOtp);
   const expiresAt = new Date(now.getTime() + OTP_EXPIRY_MINUTES * 60_000);
   const resendAvailableAt = new Date(
-    now.getTime() + OTP_RESEND_COOLDOWN_SECONDS * 1_000
+    now.getTime() + OTP_RESEND_COOLDOWN_SECONDS * 1000
   );
 
-  const [createdChallenge] = await db
-    .insert(adminOtpChallenges)
-    .values({
-      userId: user.id,
-      email: user.email,
-      otpHash,
-      expiresAt,
-      attempts: 0,
-      maxAttempts: OTP_MAX_ATTEMPTS,
-      resendAvailableAt,
-      resendCount: params.isResend
-        ? (latestChallenge?.resendCount ?? 0) + 1
-        : 0,
-      ipAddress: params.ipAddress ?? null,
-      userAgent: params.userAgent ?? null,
-    })
-    .returning({ id: adminOtpChallenges.id });
+  // Invalidate prior challenges and create the replacement inside one transaction
+  const createdChallenge = await db.transaction(async (tx) => {
+    await tx
+      .update(adminOtpChallenges)
+      .set({ invalidatedAt: now })
+      .where(
+        and(
+          eq(adminOtpChallenges.userId, user.id),
+          isNull(adminOtpChallenges.consumedAt),
+          isNull(adminOtpChallenges.invalidatedAt)
+        )
+      );
+
+    const [created] = await tx
+      .insert(adminOtpChallenges)
+      .values({
+        userId: user.id,
+        email: user.email,
+        otpHash,
+        expiresAt,
+        attempts: 0,
+        maxAttempts: OTP_MAX_ATTEMPTS,
+        resendAvailableAt,
+        resendCount: params.isResend
+          ? (latestChallenge?.resendCount ?? 0) + 1
+          : 0,
+        ipAddress: params.ipAddress ?? null,
+        userAgent: params.userAgent ?? null,
+      })
+      .returning({ id: adminOtpChallenges.id });
+
+    return created;
+  });
 
   try {
     await sendAdminOtpEmail({
@@ -305,7 +309,7 @@ export async function verifyAdminOtpAndCreateSession(params: {
   expiresAt: Date;
   admin: AuthenticatedAdmin;
 }> {
-  const { user, profile, role } = await verifyAdminEligibilityByEmail(
+  const { user } = await verifyAdminEligibilityByEmail(
     params.email,
     {
       ipAddress: params.ipAddress,
@@ -493,25 +497,127 @@ export async function verifyAdminOtpAndCreateSession(params: {
 
   inFlightChallengeVerifications.add(challenge.id);
   try {
-    // Atomic PostgreSQL conditional update: only one concurrent request can transition consumed_at from NULL
-    const consumedRows = await db
-      .update(adminOtpChallenges)
-      .set({ consumedAt: now })
-      .where(
-        and(
-          eq(adminOtpChallenges.id, challenge.id),
-          eq(adminOtpChallenges.userId, user.id),
-          eq(adminOtpChallenges.email, user.email),
-          eq(adminOtpChallenges.otpHash, challenge.otpHash),
-          isNull(adminOtpChallenges.consumedAt),
-          isNull(adminOtpChallenges.invalidatedAt),
-          gt(adminOtpChallenges.expiresAt, now),
-          lt(adminOtpChallenges.attempts, challenge.maxAttempts)
-        )
-      )
-      .returning({ id: adminOtpChallenges.id });
+    const rawSessionToken = generateSessionToken();
+    const sessionTokenHash = hashSessionToken(rawSessionToken);
+    const csrfToken = generateCsrfToken();
+    const expiresAt = new Date(
+      now.getTime() + ADMIN_SESSION_TTL_HOURS * 3_600_000
+    );
 
-    if (consumedRows.length !== 1) {
+    const txOutcome = await db.transaction(async (tx) => {
+      // Re-verify active authorization inside the transactional connection
+      // so suspended, revoked, or unapproved accounts cannot obtain sessions.
+      const eligible = await verifyAdminEligibilityByEmail(
+        params.email,
+        {
+          ipAddress: params.ipAddress,
+          userAgent: params.userAgent,
+          recordRejectionAudit: false,
+        },
+        tx
+      );
+
+      // Atomic conditional consumption inside transaction: rolls back automatically
+      // if session persistence or audit creation fails.
+      const consumedRows = await tx
+        .update(adminOtpChallenges)
+        .set({ consumedAt: now })
+        .where(
+          and(
+            eq(adminOtpChallenges.id, challenge.id),
+            eq(adminOtpChallenges.userId, eligible.user.id),
+            eq(adminOtpChallenges.email, eligible.user.email),
+            eq(adminOtpChallenges.otpHash, challenge.otpHash),
+            isNull(adminOtpChallenges.consumedAt),
+            isNull(adminOtpChallenges.invalidatedAt),
+            gt(adminOtpChallenges.expiresAt, now),
+            lt(adminOtpChallenges.attempts, challenge.maxAttempts)
+          )
+        )
+        .returning({ id: adminOtpChallenges.id });
+
+      if (consumedRows.length !== 1) {
+        return { replayBlocked: true as const };
+      }
+
+      await tx
+        .update(users)
+        .set({
+          lastLoginAt: now,
+          emailVerified: true,
+          updatedAt: now,
+        })
+        .where(eq(users.id, eligible.user.id));
+
+      await tx
+        .update(adminProfiles)
+        .set({
+          lastOtpVerifiedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(adminProfiles.id, eligible.profile.id));
+
+      const [session] = await tx
+        .insert(adminSessions)
+        .values({
+          userId: eligible.user.id,
+          sessionTokenHash,
+          csrfToken,
+          ipAddress: params.ipAddress ?? null,
+          userAgent: params.userAgent ?? null,
+          expiresAt,
+          lastActiveAt: now,
+        })
+        .returning();
+
+      if (!session) {
+        throw new Error("Admin session persistence returned no record.");
+      }
+
+      const effectivePermissions = resolveEffectiveAdminPermissions(
+        eligible.role,
+        eligible.profile.permissions
+      );
+
+      await recordAdminAuditLog(
+        {
+          adminUserId: eligible.user.id,
+          adminEmail: eligible.user.email,
+          action: "ADMIN_LOGIN_SUCCESS",
+          entityType: "ADMIN_SESSION",
+          entityId: session.id,
+          summary: `Administrator ${eligible.user.email} authenticated via email OTP`,
+          outcome: "SUCCESS",
+          newState: {
+            sessionId: session.id,
+            role: eligible.role,
+            expiresAt: expiresAt.toISOString(),
+          },
+          ipAddress: params.ipAddress,
+          userAgent: params.userAgent,
+        },
+        tx
+      );
+
+      const admin: AuthenticatedAdmin = {
+        id: eligible.user.id,
+        email: eligible.user.email,
+        name: eligible.user.name,
+        role: eligible.role,
+        status: eligible.user.status,
+        department: eligible.profile.department,
+        title: eligible.profile.title,
+        permissions: effectivePermissions,
+        lastLoginAt: now.toISOString(),
+        sessionId: session.id,
+        csrfToken,
+        sessionExpiresAt: expiresAt.toISOString(),
+      };
+
+      return { replayBlocked: false as const, admin };
+    });
+
+    if (txOutcome.replayBlocked) {
       await recordAdminAuditLog({
         adminUserId: user.id,
         adminEmail: user.email,
@@ -531,87 +637,11 @@ export async function verifyAdminOtpAndCreateSession(params: {
       );
     }
 
-    // Update last login & OTP verification timestamps
-    await db
-      .update(users)
-      .set({
-        lastLoginAt: now,
-        emailVerified: true,
-        updatedAt: now,
-      })
-      .where(eq(users.id, user.id));
-
-    await db
-      .update(adminProfiles)
-      .set({
-        lastOtpVerifiedAt: now,
-        updatedAt: now,
-      })
-      .where(eq(adminProfiles.id, profile.id));
-
-    // Create server-side admin session hashed with ADMIN_SESSION_SECRET
-    const rawSessionToken = generateSessionToken();
-    const sessionTokenHash = hashSessionToken(rawSessionToken);
-    const csrfToken = generateCsrfToken();
-    const expiresAt = new Date(
-      now.getTime() + ADMIN_SESSION_TTL_HOURS * 3_600_000
-    );
-
-    const [session] = await db
-      .insert(adminSessions)
-      .values({
-        userId: user.id,
-        sessionTokenHash,
-        csrfToken,
-        ipAddress: params.ipAddress ?? null,
-        userAgent: params.userAgent ?? null,
-        expiresAt,
-        lastActiveAt: now,
-      })
-      .returning();
-
-    const effectivePermissions = resolveEffectiveAdminPermissions(
-      role,
-      profile.permissions
-    );
-
-    await recordAdminAuditLog({
-      adminUserId: user.id,
-      adminEmail: user.email,
-      action: "ADMIN_LOGIN_SUCCESS",
-      entityType: "ADMIN_SESSION",
-      entityId: session.id,
-      summary: `Administrator ${user.email} authenticated via email OTP`,
-      outcome: "SUCCESS",
-      newState: {
-        sessionId: session.id,
-        role,
-        expiresAt: expiresAt.toISOString(),
-      },
-      ipAddress: params.ipAddress,
-      userAgent: params.userAgent,
-    });
-
-    const admin: AuthenticatedAdmin = {
-      id: user.id,
-      email: user.email,
-      name: user.name,
-      role,
-      status: user.status,
-      department: profile.department,
-      title: profile.title,
-      permissions: effectivePermissions,
-      lastLoginAt: now.toISOString(),
-      sessionId: session.id,
-      csrfToken,
-      sessionExpiresAt: expiresAt.toISOString(),
-    };
-
     return {
       rawSessionToken,
       csrfToken,
       expiresAt,
-      admin,
+      admin: txOutcome.admin,
     };
   } finally {
     inFlightChallengeVerifications.delete(challenge.id);
@@ -712,38 +742,48 @@ export async function revokeAdminSession(params: {
 
   const revokedReason = params.reason || "ADMIN_LOGOUT";
 
-  await db
-    .update(adminSessions)
-    .set({
-      revokedAt: now,
-      revokedReason,
-    })
-    .where(eq(adminSessions.id, session.id));
-
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, session.userId))
-    .limit(1);
-
-  if (user) {
-    await recordAdminAuditLog({
-      adminUserId: user.id,
-      adminEmail: user.email,
-      action:
-        revokedReason === "ADMIN_LOGOUT"
-          ? "ADMIN_LOGOUT"
-          : "ADMIN_SESSION_REVOKED",
-      entityType: "ADMIN_SESSION",
-      entityId: session.id,
-      summary: `Administrator ${user.email} session revoked (${revokedReason})`,
-      outcome: "SUCCESS",
-      newState: {
-        sessionId: session.id,
+  await db.transaction(async (tx) => {
+    const updated = await tx
+      .update(adminSessions)
+      .set({
+        revokedAt: now,
         revokedReason,
-      },
-      ipAddress: params.ipAddress,
-      userAgent: params.userAgent,
-    });
-  }
+      })
+      .where(
+        and(eq(adminSessions.id, session.id), isNull(adminSessions.revokedAt))
+      )
+      .returning({ id: adminSessions.id });
+
+    if (updated.length === 0) return;
+
+    const [user] = await tx
+      .select()
+      .from(users)
+      .where(eq(users.id, session.userId))
+      .limit(1);
+
+    if (user) {
+      await recordAdminAuditLog(
+        {
+          adminUserId: user.id,
+          adminEmail: user.email,
+          action:
+            revokedReason === "ADMIN_LOGOUT"
+              ? "ADMIN_LOGOUT"
+              : "ADMIN_SESSION_REVOKED",
+          entityType: "ADMIN_SESSION",
+          entityId: session.id,
+          summary: `Administrator ${user.email} session revoked (${revokedReason})`,
+          outcome: "SUCCESS",
+          newState: {
+            sessionId: session.id,
+            revokedReason,
+          },
+          ipAddress: params.ipAddress,
+          userAgent: params.userAgent,
+        },
+        tx
+      );
+    }
+  });
 }

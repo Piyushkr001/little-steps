@@ -1,8 +1,7 @@
 import crypto from "node:crypto";
 import net from "node:net";
-import { eq } from "drizzle-orm";
+import { sql } from "drizzle-orm";
 import { db } from "../../config/db";
-import { platformSettings } from "../../config/schema";
 
 export interface RateBucket {
   count: number;
@@ -22,8 +21,7 @@ const keyLocks = new Map<string, Promise<unknown>>();
 let forcedBackendForTests: RateLimitBackendMode | null = null;
 
 /**
- * Allows isolated automated tests to select the in-memory concurrency-locked
- * rate-limit store so tests do not write to the live Neon database.
+ * Allows isolated automated tests to select a specific rate-limit store.
  * Prohibited in production.
  */
 export function setRateLimitBackendForTests(
@@ -40,11 +38,25 @@ export function resetAllRateLimitsForTests(): void {
     return;
   }
   memoryBuckets.clear();
+  keyLocks.clear();
+}
+
+export function getActiveKeyLockCountForTests(): number {
+  return keyLocks.size;
+}
+
+function pruneExpiredMemoryBuckets(now: number): void {
+  if (memoryBuckets.size < 1000) return;
+  for (const [k, bucket] of memoryBuckets.entries()) {
+    if (bucket.resetAt <= now) {
+      memoryBuckets.delete(k);
+    }
+  }
 }
 
 /**
  * Serializes concurrent rate-limit operations on the same key within a process
- * so simultaneous bursts cannot bypass window counters.
+ * and cleans up the exact chained promise entry once completed.
  */
 async function withKeyLock<T>(
   hashedKey: string,
@@ -55,17 +67,19 @@ async function withKeyLock<T>(
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  keyLocks.set(
-    hashedKey,
-    previous.then(() => current)
+
+  const chained = previous.then(
+    () => current,
+    () => current
   );
+  keyLocks.set(hashedKey, chained);
 
   await previous;
   try {
     return await fn();
   } finally {
     release();
-    if (keyLocks.get(hashedKey) === current) {
+    if (keyLocks.get(hashedKey) === chained) {
       keyLocks.delete(hashedKey);
     }
   }
@@ -102,7 +116,6 @@ export function extractTrustedClientIp(
     if (!raw) return null;
     const first = raw.split(",")[0]?.trim() || "";
     if (!first) return null;
-    // Strip port if IPv4:port format
     const withoutPort =
       first.includes(":") && net.isIP(first) === 0
         ? first.replace(/:\d+$/, "")
@@ -124,6 +137,16 @@ export function extractTrustedClientIp(
   return normalizeCandidate(fallbackIp) ?? "127.0.0.1";
 }
 
+const REDIS_ATOMIC_RATE_LIMIT_LUA = `
+local current = redis.call('INCR', KEYS[1])
+local ttl = redis.call('PTTL', KEYS[1])
+if current == 1 or ttl < 0 then
+  redis.call('PEXPIRE', KEYS[1], tonumber(ARGV[1]))
+  ttl = tonumber(ARGV[1])
+end
+return {current, ttl}
+`;
+
 async function checkUpstashRedisRateLimit(
   hashedKey: string,
   maxRequests: number,
@@ -135,35 +158,32 @@ async function checkUpstashRedisRateLimit(
     throw new Error("Upstash Redis credentials are not configured.");
   }
 
-  const pipelineResponse = await fetch(`${url}/pipeline`, {
+  // Single atomic Redis EVAL ensuring INCR + PEXPIRE execute indivisibly
+  const response = await fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify([
-      ["INCR", hashedKey],
-      ["PTTL", hashedKey],
+      "EVAL",
+      REDIS_ATOMIC_RATE_LIMIT_LUA,
+      "1",
+      hashedKey,
+      String(windowMs),
     ]),
   });
 
-  if (!pipelineResponse.ok) {
-    throw new Error(`Redis rate-limit request failed (${pipelineResponse.status})`);
+  if (!response.ok) {
+    throw new Error(`Redis rate-limit request failed (${response.status})`);
   }
 
-  const results = (await pipelineResponse.json()) as Array<{ result: number }>;
-  const count = Number(results?.[0]?.result ?? 1);
-  let pttl = Number(results?.[1]?.result ?? -1);
-
-  if (count === 1 || pttl < 0) {
-    await fetch(`${url}/pexpire/${encodeURIComponent(hashedKey)}/${windowMs}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
-    });
-    pttl = windowMs;
-  }
+  const payload = (await response.json()) as {
+    result?: [number, number] | number[];
+  };
+  const count = Number(payload?.result?.[0] ?? 1);
+  const rawPttl = Number(payload?.result?.[1] ?? windowMs);
+  const pttl = rawPttl > 0 ? rawPttl : windowMs;
 
   if (count > maxRequests) {
     return {
@@ -186,79 +206,58 @@ async function checkDatabaseRateLimit(
   windowMs: number
 ): Promise<RateLimitResult> {
   const now = Date.now();
-  const [existing] = await db
-    .select()
-    .from(platformSettings)
-    .where(eq(platformSettings.settingKey, hashedKey))
-    .limit(1);
+  const nextResetAt = now + windowMs;
 
-  const parsed =
-    existing &&
-    typeof existing.settingValue === "object" &&
-    existing.settingValue !== null
-      ? (existing.settingValue as { count?: number; resetAt?: number })
-      : null;
+  // Single atomic PostgreSQL UPSERT eliminates multi-instance read-modify-write races
+  const result = await db.execute<{
+    setting_value: { count: number; resetAt: number };
+  }>(sql`
+    INSERT INTO platform_settings (setting_key, setting_value, category, description, updated_at)
+    VALUES (
+      ${hashedKey},
+      jsonb_build_object('count', 1, 'resetAt', ${nextResetAt}::bigint),
+      'RATE_LIMIT_INTERNAL',
+      'Shared rate-limit window state',
+      to_timestamp(${now}::double precision / 1000.0)
+    )
+    ON CONFLICT (setting_key) DO UPDATE SET
+      setting_value = CASE
+        WHEN COALESCE((platform_settings.setting_value->>'resetAt')::bigint, 0) <= ${now}::bigint
+          THEN jsonb_build_object('count', 1, 'resetAt', ${nextResetAt}::bigint)
+        ELSE
+          jsonb_build_object(
+            'count', COALESCE((platform_settings.setting_value->>'count')::int, 0) + 1,
+            'resetAt', COALESCE((platform_settings.setting_value->>'resetAt')::bigint, ${nextResetAt}::bigint)
+          )
+      END,
+      category = 'RATE_LIMIT_INTERNAL',
+      updated_at = to_timestamp(${now}::double precision / 1000.0)
+    RETURNING setting_value
+  `);
 
-  if (!existing || !parsed || typeof parsed.resetAt !== "number" || parsed.resetAt <= now) {
-    const bucket: RateBucket = {
-      count: 1,
-      resetAt: now + windowMs,
-    };
-
-    if (!existing) {
-      await db.insert(platformSettings).values({
-        settingKey: hashedKey,
-        settingValue: bucket,
-        category: "RATE_LIMIT_INTERNAL",
-        description: "Shared rate-limit window state",
-        updatedAt: new Date(now),
-      });
-    } else {
-      await db
-        .update(platformSettings)
-        .set({
-          settingValue: bucket,
-          category: "RATE_LIMIT_INTERNAL",
-          updatedAt: new Date(now),
-        })
-        .where(eq(platformSettings.id, existing.id));
-    }
-
-    return {
-      allowed: true,
-      remaining: Math.max(0, maxRequests - 1),
-      retryAfterSeconds: 0,
-    };
+  const rows =
+    Array.isArray(result)
+      ? result
+      : ((result as { rows?: Array<{ setting_value: RateBucket }> })?.rows ?? []);
+  const bucket = rows[0]?.setting_value;
+  if (!bucket || typeof bucket.count !== "number") {
+    throw new Error("PostgreSQL atomic rate-limit upsert returned no bucket.");
   }
 
-  const currentCount = Number(parsed.count ?? 0);
-  if (currentCount >= maxRequests) {
-    const retryAfterSeconds = Math.max(
-      1,
-      Math.ceil((parsed.resetAt - now) / 1000)
-    );
+  const count = Number(bucket.count);
+  const resetAt = Number(bucket.resetAt || nextResetAt);
+
+  if (count > maxRequests) {
     return {
       allowed: false,
       remaining: 0,
-      retryAfterSeconds,
+      retryAfterSeconds: Math.max(1, Math.ceil((resetAt - now) / 1000)),
     };
   }
 
-  const nextCount = currentCount + 1;
-  await db
-    .update(platformSettings)
-    .set({
-      settingValue: {
-        count: nextCount,
-        resetAt: parsed.resetAt,
-      },
-      updatedAt: new Date(now),
-    })
-    .where(eq(platformSettings.id, existing.id));
-
   return {
     allowed: true,
-    remaining: Math.max(0, maxRequests - nextCount),
+    remaining: Math.max(0, maxRequests - count),
     retryAfterSeconds: 0,
   };
 }
@@ -269,6 +268,7 @@ function checkMemoryRateLimit(
   windowMs: number
 ): RateLimitResult {
   const now = Date.now();
+  pruneExpiredMemoryBuckets(now);
   const existing = memoryBuckets.get(hashedKey);
 
   if (!existing || existing.resetAt <= now) {
@@ -284,14 +284,10 @@ function checkMemoryRateLimit(
   }
 
   if (existing.count >= maxRequests) {
-    const retryAfterSeconds = Math.max(
-      1,
-      Math.ceil((existing.resetAt - now) / 1000)
-    );
     return {
       allowed: false,
       remaining: 0,
-      retryAfterSeconds,
+      retryAfterSeconds: Math.max(1, Math.ceil((existing.resetAt - now) / 1000)),
     };
   }
 
@@ -304,9 +300,9 @@ function checkMemoryRateLimit(
 }
 
 /**
- * Production-grade shared rate limiter with per-key concurrency serialization.
- * Uses Upstash Redis when configured, or shared PostgreSQL window counters,
- * and fails closed in production if shared rate-limiting infrastructure is unreachable.
+ * Distributed shared rate limiter with per-key concurrency locking and automatic lock cleanup.
+ * Uses atomic Lua scripts for Redis and single-statement atomic SQL upserts for PostgreSQL.
+ * Fails closed in production when shared rate-limiting infrastructure is unavailable.
  */
 export async function checkRateLimit(
   rawKey: string,
@@ -314,17 +310,14 @@ export async function checkRateLimit(
   windowMs: number
 ): Promise<RateLimitResult> {
   const [scope, ...rest] = rawKey.split(":");
-  const hashedKey = hashRateLimitKey(scope || "default", rest.join(":") || rawKey);
+  const hashedKey = hashRateLimitKey(
+    scope || "default",
+    rest.join(":") || rawKey
+  );
 
   return withKeyLock(hashedKey, async () => {
-    // Also enforce in-memory gate inside the process lock for immediate burst defense
-    const localResult = checkMemoryRateLimit(hashedKey, maxRequests, windowMs);
-    if (!localResult.allowed) {
-      return localResult;
-    }
-
     if (forcedBackendForTests === "memory-test") {
-      return localResult;
+      return checkMemoryRateLimit(hashedKey, maxRequests, windowMs);
     }
 
     const hasUpstash = Boolean(
@@ -333,7 +326,11 @@ export async function checkRateLimit(
 
     try {
       if (hasUpstash || forcedBackendForTests === "redis") {
-        return await checkUpstashRedisRateLimit(hashedKey, maxRequests, windowMs);
+        return await checkUpstashRedisRateLimit(
+          hashedKey,
+          maxRequests,
+          windowMs
+        );
       }
 
       return await checkDatabaseRateLimit(hashedKey, maxRequests, windowMs);
@@ -343,7 +340,7 @@ export async function checkRateLimit(
         errorType: error instanceof Error ? error.name : "UnknownError",
       });
 
-      // Fail securely (closed) in production if shared rate-limiting infrastructure is unavailable
+      // Fail closed in production if shared rate-limiting infrastructure is unavailable
       if (process.env.NODE_ENV === "production") {
         return {
           allowed: false,
@@ -352,7 +349,7 @@ export async function checkRateLimit(
         };
       }
 
-      return localResult;
+      return checkMemoryRateLimit(hashedKey, maxRequests, windowMs);
     }
   });
 }

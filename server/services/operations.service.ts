@@ -1,5 +1,5 @@
 import { and, desc, eq, isNull } from "drizzle-orm";
-import { type AppDatabase, db } from "../../config/db";
+import { db, type DbClientOrTx } from "../../config/db";
 import {
   adminAuditLogs,
   adminProfiles,
@@ -31,30 +31,92 @@ import type {
   CenterListingStatus,
   DocumentVerificationStatus,
   IncidentStatus,
+  MalwareScanStatus,
   VerificationStatus,
 } from "../../lib/admin/types";
-import { ALLOWED_BOOKING_TRANSITIONS } from "../../lib/admin/validation";
+import {
+  ALLOWED_BOOKING_TRANSITIONS,
+  CAREGIVER_REQUIRED_CHECKLIST_KEYS,
+  CENTER_REQUIRED_CHECKLIST_KEYS,
+  PROVIDER_REQUIRED_CHECKLIST_KEYS,
+} from "../../lib/admin/validation";
+import { createSignedDocumentAccessToken } from "../security/crypto";
 import { AdminAuthError } from "./admin-auth.service";
 import { recordAdminAuditLog } from "./audit.service";
+import { isMalwareScannerConfigured } from "./document-scanner.service";
+import {
+  ALLOWED_DOCUMENT_MIME_TYPES,
+  isManagedPrivateStorageReference,
+  MAX_DOCUMENT_SIZE_BYTES,
+  verifyStoredDocumentAccessible,
+} from "./document-storage.service";
 
-const ALLOWED_DOCUMENT_MIME_TYPES = new Set([
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-]);
-const MAX_DOCUMENT_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+/**
+ * Applies PostgreSQL `FOR UPDATE` row locking when running on Drizzle PG query builders,
+ * while remaining compatible with lightweight mock query objects.
+ */
+async function executeWithRowLock<T>(queryBuilder: {
+  for?: (strength: "update") => Promise<T[]>;
+  then: PromiseLike<T[]>["then"];
+}): Promise<T[]> {
+  if (typeof queryBuilder.for === "function") {
+    return queryBuilder.for("update");
+  }
+  return queryBuilder as unknown as Promise<T[]>;
+}
 
+/**
+ * A document can only satisfy compliance verification when:
+ * - status is VERIFIED
+ * - not expired
+ * - malwareScanStatus is strictly CLEAN (never PENDING/SCANNING/INFECTED/ERROR)
+ * - trusted backend scan metadata (malwareScannedAt & malwareScanProvider) is present
+ * - not quarantined
+ */
 export function isDocumentCurrentlyValid(
   doc: {
     status: string;
     expiresAt: Date | null;
     malwareScanStatus?: string | null;
+    malwareScannedAt?: Date | null;
+    malwareScanProvider?: string | null;
+    quarantinedAt?: Date | null;
   },
   now = new Date()
 ): boolean {
   if (doc.status !== "VERIFIED") return false;
-  if (doc.malwareScanStatus && doc.malwareScanStatus !== "CLEAN") return false;
+  if (doc.quarantinedAt) return false;
+  if (doc.malwareScanStatus !== "CLEAN") return false;
+  if (!doc.malwareScannedAt || !doc.malwareScanProvider) return false;
   if (doc.expiresAt && doc.expiresAt <= now) return false;
+  return true;
+}
+
+export function isProviderScopedDocument(doc: {
+  centerId: string | null;
+  caregiverId?: string | null;
+  documentCategory?: string | null;
+}): boolean {
+  if (doc.centerId !== null && doc.centerId !== undefined) return false;
+  if (doc.caregiverId !== null && doc.caregiverId !== undefined) return false;
+  if (doc.documentCategory && doc.documentCategory !== "PROVIDER") return false;
+  return true;
+}
+
+export function isCenterScopedDocument(
+  doc: {
+    providerId: string;
+    centerId: string | null;
+    caregiverId?: string | null;
+    documentCategory?: string | null;
+  },
+  centerId: string,
+  providerId: string
+): boolean {
+  if (doc.providerId !== providerId) return false;
+  if (doc.centerId !== centerId) return false;
+  if (doc.caregiverId !== null && doc.caregiverId !== undefined) return false;
+  if (doc.documentCategory && doc.documentCategory !== "CENTER") return false;
   return true;
 }
 
@@ -96,8 +158,17 @@ export function getEffectiveCaregiverStatus(
     "NOT_VERIFIED") as CaregiverVerificationStatus;
 }
 
-function buildPrivateDocumentAccessDescriptor(docId: string): string {
-  return `/api/v1/admin/verification-documents/${docId}`;
+function buildPrivateDocumentAccessDescriptor(
+  docId: string,
+  adminId?: string,
+  canReadContent = false
+): string {
+  const base = `/api/v1/admin/verification-documents/${docId}/content`;
+  if (canReadContent && adminId) {
+    const token = createSignedDocumentAccessToken(docId, adminId, 120);
+    return `${base}?token=${encodeURIComponent(token)}`;
+  }
+  return base;
 }
 
 async function safeSelectTable<T>(queryFn: () => Promise<T[]>): Promise<T[]> {
@@ -109,7 +180,7 @@ async function safeSelectTable<T>(queryFn: () => Promise<T[]>): Promise<T[]> {
 }
 
 async function appendVerificationReviewHistory(
-  tx: Pick<AppDatabase, "insert">,
+  tx: Pick<DbClientOrTx, "insert">,
   entry: {
     subjectType: "PROVIDER" | "CENTER" | "CAREGIVER" | "DOCUMENT";
     subjectId: string;
@@ -288,104 +359,109 @@ export async function updateAdminUserStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [target] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, params.userId))
-    .limit(1);
-
-  if (!target) {
-    throw new AdminAuthError("USER_NOT_FOUND", "User account not found.", 404);
-  }
-
-  if (target.id === params.admin.id) {
-    throw new AdminAuthError(
-      "SELF_STATUS_MODIFICATION_FORBIDDEN",
-      "Administrators cannot suspend or disable their own active account.",
-      400
-    );
-  }
-
-  if (target.role === "SUPER_ADMIN" && params.admin.role !== "SUPER_ADMIN") {
-    throw new AdminAuthError(
-      "INSUFFICIENT_ROLE_PRIVILEGES",
-      "Only a SUPER_ADMIN may modify the account status of another SUPER_ADMIN.",
-      403
-    );
-  }
-
   const now = new Date();
   const isSuspending = params.status !== "ACTIVE";
 
-  const [updated] = await db
-    .update(users)
-    .set({
-      status: params.status,
-      suspendedReason: isSuspending ? params.reason : null,
-      suspendedAt: isSuspending ? now : null,
-      updatedAt: now,
-    })
-    .where(eq(users.id, target.id))
-    .returning();
+  return db.transaction(async (tx) => {
+    const [target] = await executeWithRowLock(
+      tx.select().from(users).where(eq(users.id, params.userId)).limit(1)
+    );
 
-  // Synchronize user_roles active state
-  await db
-    .update(userRoles)
-    .set({ isActive: params.status === "ACTIVE" })
-    .where(eq(userRoles.userId, target.id));
+    if (!target) {
+      throw new AdminAuthError("USER_NOT_FOUND", "User account not found.", 404);
+    }
 
-  // If suspending an admin account, also revoke their active sessions & admin profile approval
-  if (isSuspending && (target.role === "ADMIN" || target.role === "SUPER_ADMIN")) {
-    await db
-      .update(adminSessions)
-      .set({
-        revokedAt: now,
-        revokedReason: `ACCOUNT_${params.status}: ${params.reason}`,
-      })
-      .where(
-        and(
-          eq(adminSessions.userId, target.id),
-          isNull(adminSessions.revokedAt)
-        )
+    if (target.id === params.admin.id) {
+      throw new AdminAuthError(
+        "SELF_STATUS_MODIFICATION_FORBIDDEN",
+        "Administrators cannot suspend or disable their own active account.",
+        400
       );
+    }
 
-    await db
-      .update(adminProfiles)
-      .set({ isApproved: false, updatedAt: now })
-      .where(eq(adminProfiles.userId, target.id));
-  } else if (
-    params.status === "ACTIVE" &&
-    (target.role === "ADMIN" || target.role === "SUPER_ADMIN")
-  ) {
-    await db
-      .update(adminProfiles)
-      .set({ isApproved: true, updatedAt: now })
-      .where(eq(adminProfiles.userId, target.id));
-  }
+    if (target.role === "SUPER_ADMIN" && params.admin.role !== "SUPER_ADMIN") {
+      throw new AdminAuthError(
+        "INSUFFICIENT_ROLE_PRIVILEGES",
+        "Only a SUPER_ADMIN may modify the account status of another SUPER_ADMIN.",
+        403
+      );
+    }
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: `USER_STATUS_${params.status}`,
-    entityType: "USER",
-    entityId: target.id,
-    summary: `Updated status of ${target.email} from ${target.status} to ${params.status}. Reason: ${params.reason}`,
-    previousState: { status: target.status, reason: target.suspendedReason },
-    newState: { status: params.status, reason: params.reason },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    const [updated] = await tx
+      .update(users)
+      .set({
+        status: params.status,
+        suspendedReason: isSuspending ? params.reason : null,
+        suspendedAt: isSuspending ? now : null,
+        updatedAt: now,
+      })
+      .where(eq(users.id, target.id))
+      .returning();
+
+    // Synchronize user_roles active state
+    await tx
+      .update(userRoles)
+      .set({ isActive: params.status === "ACTIVE" })
+      .where(eq(userRoles.userId, target.id));
+
+    // If suspending an admin account, also revoke their active sessions & admin profile approval
+    if (
+      isSuspending &&
+      (target.role === "ADMIN" || target.role === "SUPER_ADMIN")
+    ) {
+      await tx
+        .update(adminSessions)
+        .set({
+          revokedAt: now,
+          revokedReason: `ACCOUNT_${params.status}: ${params.reason}`,
+        })
+        .where(
+          and(
+            eq(adminSessions.userId, target.id),
+            isNull(adminSessions.revokedAt)
+          )
+        );
+
+      await tx
+        .update(adminProfiles)
+        .set({ isApproved: false, updatedAt: now })
+        .where(eq(adminProfiles.userId, target.id));
+    } else if (
+      params.status === "ACTIVE" &&
+      (target.role === "ADMIN" || target.role === "SUPER_ADMIN")
+    ) {
+      await tx
+        .update(adminProfiles)
+        .set({ isApproved: true, updatedAt: now })
+        .where(eq(adminProfiles.userId, target.id));
+    }
+
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: `USER_STATUS_${params.status}`,
+        entityType: "USER",
+        entityId: target.id,
+        summary: `Updated status of ${target.email} from ${target.status} to ${params.status}. Reason: ${params.reason}`,
+        previousState: { status: target.status, reason: target.suspendedReason },
+        newState: { status: params.status, reason: params.reason },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
+
+    return {
+      id: updated.id,
+      email: updated.email,
+      name: updated.name,
+      role: updated.role,
+      status: updated.status,
+      suspendedReason: updated.suspendedReason,
+      updatedAt: updated.updatedAt.toISOString(),
+    };
   });
-
-  return {
-    id: updated.id,
-    email: updated.email,
-    name: updated.name,
-    role: updated.role,
-    status: updated.status,
-    suspendedReason: updated.suspendedReason,
-    updatedAt: updated.updatedAt.toISOString(),
-  };
 }
 
 // ==========================================
@@ -576,8 +652,12 @@ export function evaluateProviderApprovalEligibility(params: {
     status: string;
     expiresAt: Date | null;
     malwareScanStatus?: string | null;
+    malwareScannedAt?: Date | null;
+    malwareScanProvider?: string | null;
+    quarantinedAt?: Date | null;
   }>;
   submittedChecklist?: Record<string, boolean>;
+  enforceSubmittedChecklist?: boolean;
   now?: Date;
 }) {
   const now = params.now ?? new Date();
@@ -592,26 +672,44 @@ export function evaluateProviderApprovalEligibility(params: {
     );
   }
 
-  // Organization-scoped documents (exclude caregiver-only documents)
-  const orgDocs = params.providerDocuments.filter((d) => !d.caregiverId);
+  // Strictly enforce organization-scoped (PROVIDER) documents only.
+  // Never allow centre-scoped or caregiver-scoped documents to satisfy organization approval.
+  const orgScopedDocs = params.providerDocuments.filter(
+    (d) =>
+      d.providerId === params.provider.id && isProviderScopedDocument(d)
+  );
 
-  if (orgDocs.length === 0) {
+  if (orgScopedDocs.length === 0) {
     blockingReasons.push(
-      "At least one organization verification document (e.g., childcare license or registration certificate) must be submitted."
+      "At least one organization-scoped verification document (category PROVIDER, not centre or caregiver scoped) must be submitted and verified."
     );
   }
 
   const referencedIds = params.verification.documentReferences ?? [];
   const requiredDocsToInspect =
     referencedIds.length > 0
-      ? orgDocs.filter((d) => referencedIds.includes(d.id))
-      : orgDocs.filter((d) => !d.centerId).length > 0
-        ? orgDocs.filter((d) => !d.centerId)
-        : orgDocs;
+      ? orgScopedDocs.filter((d) => referencedIds.includes(d.id))
+      : orgScopedDocs;
 
-  if (referencedIds.length > 0 && requiredDocsToInspect.length < referencedIds.length) {
+  if (
+    referencedIds.length > 0 &&
+    requiredDocsToInspect.length < referencedIds.length
+  ) {
     blockingReasons.push(
-      "One or more referenced verification documents could not be found."
+      "One or more referenced verification documents are missing or are not organization-scoped (PROVIDER) documents."
+    );
+  }
+
+  const infectedOrUnscannedDocs = requiredDocsToInspect.filter(
+    (d) =>
+      d.quarantinedAt ||
+      d.malwareScanStatus !== "CLEAN" ||
+      !d.malwareScannedAt ||
+      !d.malwareScanProvider
+  );
+  if (infectedOrUnscannedDocs.length > 0) {
+    blockingReasons.push(
+      `Organization document(s) lack trusted CLEAN malware scan completion: ${infectedOrUnscannedDocs.map((d) => `${d.documentTitle} (${d.malwareScanStatus ?? "PENDING"})`).join(", ")}.`
     );
   }
 
@@ -634,7 +732,8 @@ export function evaluateProviderApprovalEligibility(params: {
   }
 
   const unverifiedDocs = requiredDocsToInspect.filter(
-    (d) => d.status !== "VERIFIED" && d.status !== "REJECTED" && d.status !== "EXPIRED"
+    (d) =>
+      d.status !== "VERIFIED" && d.status !== "REJECTED" && d.status !== "EXPIRED"
   );
   if (unverifiedDocs.length > 0) {
     blockingReasons.push(
@@ -645,15 +744,15 @@ export function evaluateProviderApprovalEligibility(params: {
   const verifiedValidDocs = requiredDocsToInspect.filter((d) =>
     isDocumentCurrentlyValid(d, now)
   );
-  if (orgDocs.length > 0 && verifiedValidDocs.length === 0) {
+  if (orgScopedDocs.length > 0 && verifiedValidDocs.length === 0) {
     blockingReasons.push(
-      "No valid, non-expired VERIFIED organization documents are present."
+      "No valid, malware-clean, non-expired VERIFIED organization documents are present."
     );
   }
 
   const requestedTypes = params.verification.requestedDocuments ?? [];
   for (const reqType of requestedTypes) {
-    const hasVerifiedType = orgDocs.some(
+    const hasVerifiedType = orgScopedDocs.some(
       (d) =>
         d.documentType.toUpperCase() === reqType.toUpperCase() &&
         isDocumentCurrentlyValid(d, now)
@@ -670,10 +769,14 @@ export function evaluateProviderApprovalEligibility(params: {
     ...(params.submittedChecklist ?? {}),
   };
 
-  if (effectiveChecklist.licenseVerified !== true) {
-    blockingReasons.push(
-      "Mandatory checklist item 'licenseVerified' must be explicitly confirmed."
-    );
+  if (params.enforceSubmittedChecklist) {
+    for (const key of PROVIDER_REQUIRED_CHECKLIST_KEYS) {
+      if (params.submittedChecklist?.[key] !== true) {
+        blockingReasons.push(
+          `Mandatory provider checklist item '${key}' must be explicitly verified (true).`
+        );
+      }
+    }
   }
 
   for (const [key, val] of Object.entries(effectiveChecklist)) {
@@ -687,8 +790,9 @@ export function evaluateProviderApprovalEligibility(params: {
   return {
     eligible: blockingReasons.length === 0,
     blockingReasons,
+    requiredChecklistKeys: PROVIDER_REQUIRED_CHECKLIST_KEYS,
     verifiedDocumentsCount: verifiedValidDocs.length,
-    totalOrganizationDocumentsCount: orgDocs.length,
+    totalOrganizationDocumentsCount: orgScopedDocs.length,
     effectiveChecklist,
   };
 }
@@ -792,6 +896,7 @@ export async function listAdminVerifications(filters: {
           eligible: eligibility.eligible,
           reasons: eligibility.blockingReasons,
           blockingReasons: eligibility.blockingReasons,
+          requiredChecklistKeys: PROVIDER_REQUIRED_CHECKLIST_KEYS,
           verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
           totalOrganizationDocumentsCount:
             eligibility.totalOrganizationDocumentsCount,
@@ -809,17 +914,30 @@ export async function listAdminVerifications(filters: {
         })),
         documents: provDocs.map((d) => {
           const isExpired = d.expiresAt !== null && d.expiresAt <= now;
+          const scanStatus = (d.malwareScanStatus || "PENDING") as MalwareScanStatus;
           return {
             id: d.id,
+            providerId: d.providerId,
             centerId: d.centerId,
             caregiverId: d.caregiverId ?? null,
             documentCategory: d.documentCategory ?? "PROVIDER",
             documentType: d.documentType,
             documentTitle: d.documentTitle,
+            originalFileName: d.originalFileName ?? null,
             mimeType: d.mimeType,
             fileSizeBytes: d.fileSizeBytes,
             status: isExpired && d.status !== "REJECTED" ? "EXPIRED" : d.status,
-            malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+            isExpired,
+            malwareScanStatus: scanStatus,
+            malwareScanProvider: d.malwareScanProvider ?? null,
+            malwareScannedAt: d.malwareScannedAt
+              ? d.malwareScannedAt.toISOString()
+              : null,
+            malwareScanResult: d.malwareScanResult ?? null,
+            quarantinedAt: d.quarantinedAt
+              ? d.quarantinedAt.toISOString()
+              : null,
+            scannerConfigured: isMalwareScannerConfigured(),
             checksumSha256: d.checksumSha256,
             expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
             reviewNotes: d.reviewNotes,
@@ -853,7 +971,8 @@ export async function listAdminVerifications(filters: {
 export async function approveProviderVerification(params: {
   verificationId: string;
   reviewComments: string;
-  checklistState?: Record<string, boolean>;
+  checklistState: Record<string, boolean>;
+  expiresAt?: string;
   admin: AuthenticatedAdmin;
   ipAddress?: string;
   userAgent?: string;
@@ -868,14 +987,26 @@ export async function approveProviderVerification(params: {
   }
 
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 365 * 86_400_000);
+  const expiresAt = params.expiresAt
+    ? new Date(params.expiresAt)
+    : new Date(now.getTime() + 365 * 86_400_000);
+
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt <= now) {
+    throw new AdminAuthError(
+      "INVALID_EXPIRATION_DATE",
+      "Provider verification expiration date must be a valid future timestamp.",
+      400
+    );
+  }
 
   const txResult = await db.transaction(async (tx) => {
-    const [verification] = await tx
-      .select()
-      .from(providerVerifications)
-      .where(eq(providerVerifications.id, params.verificationId))
-      .limit(1);
+    const [verification] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providerVerifications)
+        .where(eq(providerVerifications.id, params.verificationId))
+        .limit(1)
+    );
 
     if (!verification) {
       throw new AdminAuthError(
@@ -885,11 +1016,13 @@ export async function approveProviderVerification(params: {
       );
     }
 
-    const [provider] = await tx
-      .select()
-      .from(providers)
-      .where(eq(providers.id, verification.providerId))
-      .limit(1);
+    const [provider] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providers)
+        .where(eq(providers.id, verification.providerId))
+        .limit(1)
+    );
 
     if (!provider) {
       throw new AdminAuthError(
@@ -929,6 +1062,7 @@ export async function approveProviderVerification(params: {
       verification,
       providerDocuments: providerDocs,
       submittedChecklist: params.checklistState,
+      enforceSubmittedChecklist: true,
       now,
     });
 
@@ -998,34 +1132,39 @@ export async function approveProviderVerification(params: {
       createdAt: now,
     });
 
-    return { verification, provider, eligibility };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "PROVIDER_VERIFICATION_APPROVED",
+        entityType: "PROVIDER_VERIFICATION",
+        entityId: verification.id,
+        summary: `Approved organization verification for ${provider.organizationName} (independent of centres and documents). Comments: ${trimmedComments}`,
+        previousState: {
+          status: verification.status,
+          isPublished: provider.isPublished,
+        },
+        newState: {
+          status: "APPROVED",
+          isPublished: true,
+          verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
+          checklistState: eligibility.effectiveChecklist,
+          expiresAt: expiresAt.toISOString(),
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "PROVIDER_VERIFICATION_APPROVED",
-    entityType: "PROVIDER_VERIFICATION",
-    entityId: txResult.verification.id,
-    summary: `Approved organization verification for ${txResult.provider.organizationName} (independent of centres and documents). Comments: ${trimmedComments}`,
-    previousState: {
-      status: txResult.verification.status,
-      isPublished: txResult.provider.isPublished,
-    },
-    newState: {
-      status: "APPROVED",
-      isPublished: true,
-      verifiedDocumentsCount: txResult.eligibility.verifiedDocumentsCount,
-      checklistState: txResult.eligibility.effectiveChecklist,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { verification, provider, eligibility };
   });
 
   return {
     verificationId: txResult.verification.id,
     providerId: txResult.provider.id,
     status: "APPROVED" as const,
+    expiresAt: expiresAt.toISOString(),
     reviewedBy: params.admin.email,
     reviewedAt: now.toISOString(),
   };
@@ -1046,11 +1185,13 @@ export async function rejectProviderVerification(params: {
     : "REJECTED";
 
   const txResult = await db.transaction(async (tx) => {
-    const [verification] = await tx
-      .select()
-      .from(providerVerifications)
-      .where(eq(providerVerifications.id, params.verificationId))
-      .limit(1);
+    const [verification] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providerVerifications)
+        .where(eq(providerVerifications.id, params.verificationId))
+        .limit(1)
+    );
 
     if (!verification) {
       throw new AdminAuthError(
@@ -1060,11 +1201,13 @@ export async function rejectProviderVerification(params: {
       );
     }
 
-    const [provider] = await tx
-      .select()
-      .from(providers)
-      .where(eq(providers.id, verification.providerId))
-      .limit(1);
+    const [provider] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providers)
+        .where(eq(providers.id, verification.providerId))
+        .limit(1)
+    );
 
     if (!provider) {
       throw new AdminAuthError(
@@ -1129,8 +1272,6 @@ export async function rejectProviderVerification(params: {
       })
       .where(eq(providers.id, provider.id));
 
-    // When a provider is rejected or suspended, its centres cannot remain publicly ACTIVE for new bookings,
-    // but we only demote listingStatus (and suspend if provider is suspended) without overwriting independent centre review history.
     if (params.suspendProvider) {
       await tx
         .update(centers)
@@ -1170,29 +1311,32 @@ export async function rejectProviderVerification(params: {
       createdAt: now,
     });
 
-    return { verification, provider };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: params.suspendProvider
+          ? "PROVIDER_VERIFICATION_SUSPENDED"
+          : "PROVIDER_VERIFICATION_REJECTED",
+        entityType: "PROVIDER_VERIFICATION",
+        entityId: verification.id,
+        summary: `${nextStatus} verification for ${provider.organizationName}. Reason: ${params.rejectionReason}`,
+        previousState: {
+          status: verification.status,
+          isPublished: provider.isPublished,
+        },
+        newState: {
+          status: nextStatus,
+          isPublished: false,
+          rejectionReason: params.rejectionReason,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: params.suspendProvider
-      ? "PROVIDER_VERIFICATION_SUSPENDED"
-      : "PROVIDER_VERIFICATION_REJECTED",
-    entityType: "PROVIDER_VERIFICATION",
-    entityId: txResult.verification.id,
-    summary: `${nextStatus} verification for ${txResult.provider.organizationName}. Reason: ${params.rejectionReason}`,
-    previousState: {
-      status: txResult.verification.status,
-      isPublished: txResult.provider.isPublished,
-    },
-    newState: {
-      status: nextStatus,
-      isPublished: false,
-      rejectionReason: params.rejectionReason,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { verification, provider };
   });
 
   return {
@@ -1216,11 +1360,13 @@ export async function requestProviderDocuments(params: {
   const now = new Date();
 
   const txResult = await db.transaction(async (tx) => {
-    const [verification] = await tx
-      .select()
-      .from(providerVerifications)
-      .where(eq(providerVerifications.id, params.verificationId))
-      .limit(1);
+    const [verification] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providerVerifications)
+        .where(eq(providerVerifications.id, params.verificationId))
+        .limit(1)
+    );
 
     if (!verification) {
       throw new AdminAuthError(
@@ -1230,11 +1376,13 @@ export async function requestProviderDocuments(params: {
       );
     }
 
-    const [provider] = await tx
-      .select()
-      .from(providers)
-      .where(eq(providers.id, verification.providerId))
-      .limit(1);
+    const [provider] = await executeWithRowLock(
+      tx
+        .select()
+        .from(providers)
+        .where(eq(providers.id, verification.providerId))
+        .limit(1)
+    );
 
     if (!provider) {
       throw new AdminAuthError(
@@ -1279,23 +1427,26 @@ export async function requestProviderDocuments(params: {
       createdAt: now,
     });
 
-    return { verification, provider };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "PROVIDER_DOCUMENTS_REQUESTED",
+        entityType: "PROVIDER_VERIFICATION",
+        entityId: verification.id,
+        summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) from ${provider.organizationName}`,
+        previousState: { status: verification.status },
+        newState: {
+          status: "UNDER_REVIEW",
+          requestedDocuments: params.requestedDocuments,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "PROVIDER_DOCUMENTS_REQUESTED",
-    entityType: "PROVIDER_VERIFICATION",
-    entityId: txResult.verification.id,
-    summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) from ${txResult.provider.organizationName}`,
-    previousState: { status: txResult.verification.status },
-    newState: {
-      status: "UNDER_REVIEW",
-      requestedDocuments: params.requestedDocuments,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { verification, provider };
   });
 
   return {
@@ -1343,12 +1494,18 @@ export function evaluateCenterApprovalEligibility(params: {
     | undefined;
   centerDocuments: Array<{
     id: string;
+    providerId: string;
     centerId: string | null;
+    caregiverId?: string | null;
+    documentCategory?: string | null;
     documentType: string;
     documentTitle: string;
     status: string;
     expiresAt: Date | null;
     malwareScanStatus?: string | null;
+    malwareScannedAt?: Date | null;
+    malwareScanProvider?: string | null;
+    quarantinedAt?: Date | null;
   }>;
   centerCaregivers: Array<{
     id: string;
@@ -1360,6 +1517,7 @@ export function evaluateCenterApprovalEligibility(params: {
   requestedDocuments?: string[] | null;
   submittedChecklist?: Record<string, boolean>;
   existingChecklist?: Record<string, boolean> | null;
+  enforceSubmittedChecklist?: boolean;
   now?: Date;
 }) {
   const now = params.now ?? new Date();
@@ -1414,13 +1572,17 @@ export function evaluateCenterApprovalEligibility(params: {
     );
   }
 
-  // Rule 3: Centre documents must be verified and current
-  if (params.centerDocuments.length === 0) {
+  // Rule 3: Centre documents must be strictly scoped to this centre, malware-scanned, verified, and current
+  const scopedCenterDocs = params.centerDocuments.filter((d) =>
+    isCenterScopedDocument(d, params.center.id, params.center.providerId)
+  );
+
+  if (scopedCenterDocs.length === 0) {
     blockingReasons.push(
-      "At least one facility/centre verification document must be submitted for this daycare centre."
+      "At least one facility/centre-scoped verification document must be submitted for this daycare centre."
     );
   } else {
-    const rejectedCenterDocs = params.centerDocuments.filter(
+    const rejectedCenterDocs = scopedCenterDocs.filter(
       (d) => d.status === "REJECTED"
     );
     if (rejectedCenterDocs.length > 0) {
@@ -1429,7 +1591,7 @@ export function evaluateCenterApprovalEligibility(params: {
       );
     }
 
-    const expiredCenterDocs = params.centerDocuments.filter(
+    const expiredCenterDocs = scopedCenterDocs.filter(
       (d) =>
         d.status === "EXPIRED" || (d.expiresAt !== null && d.expiresAt <= now)
     );
@@ -1439,7 +1601,20 @@ export function evaluateCenterApprovalEligibility(params: {
       );
     }
 
-    const unverifiedCenterDocs = params.centerDocuments.filter(
+    const unscannedOrInfectedDocs = scopedCenterDocs.filter(
+      (d) =>
+        Boolean(d.quarantinedAt) ||
+        d.malwareScanStatus !== "CLEAN" ||
+        !d.malwareScannedAt ||
+        !d.malwareScanProvider
+    );
+    if (unscannedOrInfectedDocs.length > 0) {
+      blockingReasons.push(
+        `Centre document(s) lack trusted CLEAN malware scan completion: ${unscannedOrInfectedDocs.map((d) => `${d.documentTitle} (${d.malwareScanStatus ?? "PENDING"})`).join(", ")}.`
+      );
+    }
+
+    const unverifiedCenterDocs = scopedCenterDocs.filter(
       (d) =>
         d.status !== "VERIFIED" &&
         d.status !== "REJECTED" &&
@@ -1452,17 +1627,17 @@ export function evaluateCenterApprovalEligibility(params: {
     }
   }
 
-  const verifiedCenterDocs = params.centerDocuments.filter((d) =>
+  const verifiedCenterDocs = scopedCenterDocs.filter((d) =>
     isDocumentCurrentlyValid(d, now)
   );
-  if (params.centerDocuments.length > 0 && verifiedCenterDocs.length === 0) {
+  if (scopedCenterDocs.length > 0 && verifiedCenterDocs.length === 0) {
     blockingReasons.push(
-      "No valid, non-expired VERIFIED centre documents are available."
+      "No valid, malware-clean, non-expired VERIFIED centre documents are available."
     );
   }
 
   for (const reqDoc of params.requestedDocuments ?? []) {
-    const satisfied = params.centerDocuments.some(
+    const satisfied = scopedCenterDocs.some(
       (d) =>
         d.documentType.toUpperCase() === reqDoc.toUpperCase() &&
         isDocumentCurrentlyValid(d, now)
@@ -1484,16 +1659,30 @@ export function evaluateCenterApprovalEligibility(params: {
     );
   }
 
-  const effectiveChecklist: Record<string, boolean> = {
-    ...(params.existingChecklist ?? {}),
-    ...(params.submittedChecklist ?? {}),
-  };
+  const submitted = params.submittedChecklist ?? {};
+  const effectiveChecklist: Record<string, boolean> =
+    params.enforceSubmittedChecklist
+      ? { ...submitted }
+      : {
+          ...(params.existingChecklist ?? {}),
+          ...submitted,
+        };
 
-  for (const [key, val] of Object.entries(effectiveChecklist)) {
-    if (val === false) {
-      blockingReasons.push(
-        `Centre checklist item '${key}' is marked incomplete (false).`
-      );
+  if (params.enforceSubmittedChecklist) {
+    for (const requiredKey of CENTER_REQUIRED_CHECKLIST_KEYS) {
+      if (submitted[requiredKey] !== true) {
+        blockingReasons.push(
+          `Mandatory centre checklist item '${requiredKey}' must be reviewed and confirmed (true).`
+        );
+      }
+    }
+  } else {
+    for (const [key, val] of Object.entries(effectiveChecklist)) {
+      if (val === false) {
+        blockingReasons.push(
+          `Centre checklist item '${key}' is marked incomplete (false).`
+        );
+      }
     }
   }
 
@@ -1501,7 +1690,7 @@ export function evaluateCenterApprovalEligibility(params: {
     eligible: blockingReasons.length === 0,
     blockingReasons,
     verifiedDocumentsCount: verifiedCenterDocs.length,
-    totalCenterDocumentsCount: params.centerDocuments.length,
+    totalCenterDocumentsCount: scopedCenterDocs.length,
     eligibleCaregiversCount: eligibleCaregivers.length,
     totalCaregiversCount: params.centerCaregivers.length,
     effectiveChecklist,
@@ -1735,7 +1924,12 @@ export async function getAdminCenterById(centerId: string) {
         d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
           ? "EXPIRED"
           : d.status,
-      malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+      malwareScanStatus: (d.malwareScanStatus || "PENDING") as MalwareScanStatus,
+      malwareScanProvider: d.malwareScanProvider ?? null,
+      malwareScannedAt: d.malwareScannedAt
+        ? d.malwareScannedAt.toISOString()
+        : null,
+      quarantinedAt: d.quarantinedAt ? d.quarantinedAt.toISOString() : null,
       expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
       reviewNotes: d.reviewNotes,
       rejectionReason: d.rejectionReason ?? null,
@@ -1789,118 +1983,121 @@ export async function updateAdminCenterStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-  const [center] = await db
-    .select()
-    .from(centers)
-    .where(eq(centers.id, params.centerId))
-    .limit(1);
-
-  if (!center) {
-    throw new AdminAuthError(
-      "CENTER_NOT_FOUND",
-      "Daycare centre not found.",
-      404
-    );
-  }
-
   const now = new Date();
 
-  if (params.listingStatus === "ACTIVE") {
-    if (center.verificationStatus !== "APPROVED") {
+  return db.transaction(async (tx) => {
+    const [center] = await executeWithRowLock(
+      tx.select().from(centers).where(eq(centers.id, params.centerId)).limit(1)
+    );
+
+    if (!center) {
       throw new AdminAuthError(
-        "CENTER_UNVERIFIED",
-        "Cannot publicly activate a centre listing until its independent centre verification status is APPROVED.",
-        400
+        "CENTER_NOT_FOUND",
+        "Daycare centre not found.",
+        404
       );
     }
 
-    if (
-      center.verificationExpiresAt &&
-      center.verificationExpiresAt <= now
-    ) {
-      throw new AdminAuthError(
-        "CENTER_VERIFICATION_EXPIRED",
-        "Cannot activate centre listing: centre verification has expired.",
-        400
-      );
+    if (params.listingStatus === "ACTIVE") {
+      if (center.verificationStatus !== "APPROVED") {
+        throw new AdminAuthError(
+          "CENTER_UNVERIFIED",
+          "Cannot publicly activate a centre listing until its independent centre verification status is APPROVED.",
+          400
+        );
+      }
+
+      if (
+        center.verificationExpiresAt &&
+        center.verificationExpiresAt <= now
+      ) {
+        throw new AdminAuthError(
+          "CENTER_VERIFICATION_EXPIRED",
+          "Cannot activate centre listing: centre verification has expired.",
+          400
+        );
+      }
+
+      const [providerRows, centerDocs, centerCaregivers] = await Promise.all([
+        tx
+          .select()
+          .from(providers)
+          .where(eq(providers.id, center.providerId))
+          .limit(1),
+        tx
+          .select()
+          .from(verificationDocuments)
+          .where(eq(verificationDocuments.centerId, center.id)),
+        tx.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
+      ]);
+
+      const eligibility = evaluateCenterApprovalEligibility({
+        center,
+        provider: providerRows[0],
+        centerDocuments: centerDocs,
+        centerCaregivers,
+        now,
+      });
+
+      if (!eligibility.eligible) {
+        throw new AdminAuthError(
+          "CENTER_ACTIVATION_ELIGIBILITY_FAILED",
+          `Cannot activate centre listing: ${eligibility.blockingReasons.join(" ")}`,
+          400
+        );
+      }
     }
 
-    const [providerRows, centerDocs, centerCaregivers] = await Promise.all([
-      db
-        .select()
-        .from(providers)
-        .where(eq(providers.id, center.providerId))
-        .limit(1),
-      db
-        .select()
-        .from(verificationDocuments)
-        .where(eq(verificationDocuments.centerId, center.id)),
-      db.select().from(caregivers).where(eq(caregivers.centerId, center.id)),
-    ]);
+    // Check active bookings so administrative actions never silently corrupt existing bookings
+    const existingBookings = await tx
+      .select()
+      .from(bookings)
+      .where(eq(bookings.centerId, center.id));
 
-    const eligibility = evaluateCenterApprovalEligibility({
-      center,
-      provider: providerRows[0],
-      centerDocuments: centerDocs,
-      centerCaregivers,
-      now,
-    });
+    const activeBookings = existingBookings.filter((b) =>
+      ["CONFIRMED", "CHECKED_IN"].includes(b.status)
+    );
 
-    if (!eligibility.eligible) {
-      throw new AdminAuthError(
-        "CENTER_ACTIVATION_ELIGIBILITY_FAILED",
-        `Cannot activate centre listing: ${eligibility.blockingReasons.join(" ")}`,
-        400
-      );
-    }
-  }
+    const [updated] = await tx
+      .update(centers)
+      .set({
+        listingStatus: params.listingStatus,
+        suspendedReason:
+          params.listingStatus === "SUSPENDED" ? params.reason : null,
+        updatedAt: now,
+      })
+      .where(eq(centers.id, center.id))
+      .returning();
 
-  // Check active bookings so administrative actions never silently corrupt existing bookings
-  const existingBookings = await db
-    .select()
-    .from(bookings)
-    .where(eq(bookings.centerId, center.id));
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: `CENTER_STATUS_${params.listingStatus}`,
+        entityType: "CENTER",
+        entityId: center.id,
+        summary: `Changed listing status of "${center.name}" from ${center.listingStatus} to ${params.listingStatus} (${activeBookings.length} active bookings preserved). Reason: ${params.reason}`,
+        previousState: { listingStatus: center.listingStatus },
+        newState: {
+          listingStatus: params.listingStatus,
+          reason: params.reason,
+          preservedActiveBookingsCount: activeBookings.length,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  const activeBookings = existingBookings.filter((b) =>
-    ["CONFIRMED", "CHECKED_IN"].includes(b.status)
-  );
-
-  const [updated] = await db
-    .update(centers)
-    .set({
-      listingStatus: params.listingStatus,
-      suspendedReason:
-        params.listingStatus === "SUSPENDED" ? params.reason : null,
-      updatedAt: now,
-    })
-    .where(eq(centers.id, center.id))
-    .returning();
-
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: `CENTER_STATUS_${params.listingStatus}`,
-    entityType: "CENTER",
-    entityId: center.id,
-    summary: `Changed listing status of "${center.name}" from ${center.listingStatus} to ${params.listingStatus} (${activeBookings.length} active bookings preserved). Reason: ${params.reason}`,
-    previousState: { listingStatus: center.listingStatus },
-    newState: {
-      listingStatus: params.listingStatus,
-      reason: params.reason,
+    return {
+      id: updated.id,
+      name: updated.name,
+      listingStatus: updated.listingStatus,
+      suspendedReason: updated.suspendedReason,
       preservedActiveBookingsCount: activeBookings.length,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+      updatedAt: updated.updatedAt.toISOString(),
+    };
   });
-
-  return {
-    id: updated.id,
-    name: updated.name,
-    listingStatus: updated.listingStatus,
-    suspendedReason: updated.suspendedReason,
-    preservedActiveBookingsCount: activeBookings.length,
-    updatedAt: updated.updatedAt.toISOString(),
-  };
 }
 
 export async function listAdminCenterVerifications(filters: {
@@ -1940,7 +2137,9 @@ export async function listAdminCenterVerifications(filters: {
   return allCenters
     .map((c) => {
       const prov = providerMap.get(c.providerId);
-      const centerDocs = allDocs.filter((d) => d.centerId === c.id);
+      const centerDocs = allDocs.filter((d) =>
+        isCenterScopedDocument(d, c.id, c.providerId)
+      );
       const centerCaregivers = allCaregivers.filter(
         (cg) => cg.centerId === c.id
       );
@@ -2032,6 +2231,12 @@ export async function listAdminCenterVerifications(filters: {
           id: d.id,
           documentType: d.documentType,
           documentTitle: d.documentTitle,
+          malwareScanStatus: (d.malwareScanStatus || "PENDING") as MalwareScanStatus,
+          malwareScanProvider: d.malwareScanProvider ?? null,
+          malwareScannedAt: d.malwareScannedAt
+            ? d.malwareScannedAt.toISOString()
+            : null,
+          quarantinedAt: d.quarantinedAt ? d.quarantinedAt.toISOString() : null,
           status:
             d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
               ? "EXPIRED"
@@ -2083,6 +2288,7 @@ export async function approveCenterVerification(params: {
   checklistState?: Record<string, boolean>;
   safetyComplianceNotes?: string;
   activateListing?: boolean;
+  expiresAt?: string;
   admin: AuthenticatedAdmin;
   ipAddress?: string;
   userAgent?: string;
@@ -2097,7 +2303,18 @@ export async function approveCenterVerification(params: {
   }
 
   const now = new Date();
-  const expiresAt = new Date(now.getTime() + 365 * 86_400_000);
+  const expiresAt = params.expiresAt
+    ? new Date(params.expiresAt)
+    : new Date(now.getTime() + 365 * 86_400_000);
+
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt <= now) {
+    throw new AdminAuthError(
+      "INVALID_EXPIRATION_DATE",
+      "Daycare centre verification expiration date must be a valid future timestamp.",
+      400
+    );
+  }
+
   const targetListingStatus: CenterListingStatus =
     params.activateListing === false ? "INACTIVE" : "ACTIVE";
 
@@ -2111,11 +2328,9 @@ export async function approveCenterVerification(params: {
     const resolvedCenterId =
       existingVerifs[0]?.centerId ?? params.idOrCenterId;
 
-    const [center] = await tx
-      .select()
-      .from(centers)
-      .where(eq(centers.id, resolvedCenterId))
-      .limit(1);
+    const [center] = await executeWithRowLock(
+      tx.select().from(centers).where(eq(centers.id, resolvedCenterId)).limit(1)
+    );
 
     if (!center) {
       throw new AdminAuthError(
@@ -2191,6 +2406,7 @@ export async function approveCenterVerification(params: {
       requestedDocuments: verifRecord?.requestedDocuments ?? [],
       existingChecklist: verifRecord?.checklistState ?? {},
       submittedChecklist: params.checklistState,
+      enforceSubmittedChecklist: true,
       now,
     });
 
@@ -2286,30 +2502,34 @@ export async function approveCenterVerification(params: {
         verifiedDocumentsCount: eligibility.verifiedDocumentsCount,
         eligibleCaregiversCount: eligibility.eligibleCaregiversCount,
         listingStatus: targetListingStatus,
+        expiresAt: expiresAt.toISOString(),
       },
       createdAt: now,
     });
 
-    return { center, provider, verifId, eligibility };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "CENTER_VERIFICATION_APPROVED",
+        entityType: "CENTER_VERIFICATION",
+        entityId: center.id,
+        summary: `Approved daycare centre "${center.name}" (${provider.organizationName}) and set listingStatus to ${targetListingStatus}. Comments: ${trimmedComments}`,
+        previousState: {
+          verificationStatus: center.verificationStatus,
+          listingStatus: center.listingStatus,
+        },
+        newState: {
+          verificationStatus: "APPROVED",
+          listingStatus: targetListingStatus,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "CENTER_VERIFICATION_APPROVED",
-    entityType: "CENTER_VERIFICATION",
-    entityId: txResult.center.id,
-    summary: `Approved daycare centre "${txResult.center.name}" (${txResult.provider.organizationName}) and set listingStatus to ${targetListingStatus}. Comments: ${trimmedComments}`,
-    previousState: {
-      verificationStatus: txResult.center.verificationStatus,
-      listingStatus: txResult.center.listingStatus,
-    },
-    newState: {
-      verificationStatus: "APPROVED",
-      listingStatus: targetListingStatus,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { center, provider, verifId, eligibility };
   });
 
   return {
@@ -2317,6 +2537,7 @@ export async function approveCenterVerification(params: {
     centerId: txResult.center.id,
     status: "APPROVED" as const,
     listingStatus: targetListingStatus,
+    expiresAt: expiresAt.toISOString(),
     reviewedBy: params.admin.email,
     reviewedAt: now.toISOString(),
   };
@@ -2349,11 +2570,9 @@ export async function rejectCenterVerification(params: {
     const resolvedCenterId =
       existingVerifs[0]?.centerId ?? params.idOrCenterId;
 
-    const [center] = await tx
-      .select()
-      .from(centers)
-      .where(eq(centers.id, resolvedCenterId))
-      .limit(1);
+    const [center] = await executeWithRowLock(
+      tx.select().from(centers).where(eq(centers.id, resolvedCenterId)).limit(1)
+    );
 
     if (!center) {
       throw new AdminAuthError(
@@ -2459,29 +2678,32 @@ export async function rejectCenterVerification(params: {
       createdAt: now,
     });
 
-    return { center, verifId };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: params.suspendCenter
+          ? "CENTER_VERIFICATION_SUSPENDED"
+          : "CENTER_VERIFICATION_REJECTED",
+        entityType: "CENTER_VERIFICATION",
+        entityId: center.id,
+        summary: `${nextStatus} daycare centre "${center.name}". Reason: ${params.rejectionReason}`,
+        previousState: {
+          verificationStatus: center.verificationStatus,
+          listingStatus: center.listingStatus,
+        },
+        newState: {
+          verificationStatus: nextStatus,
+          listingStatus: nextListingStatus,
+          rejectionReason: params.rejectionReason,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: params.suspendCenter
-      ? "CENTER_VERIFICATION_SUSPENDED"
-      : "CENTER_VERIFICATION_REJECTED",
-    entityType: "CENTER_VERIFICATION",
-    entityId: txResult.center.id,
-    summary: `${nextStatus} daycare centre "${txResult.center.name}". Reason: ${params.rejectionReason}`,
-    previousState: {
-      verificationStatus: txResult.center.verificationStatus,
-      listingStatus: txResult.center.listingStatus,
-    },
-    newState: {
-      verificationStatus: nextStatus,
-      listingStatus: nextListingStatus,
-      rejectionReason: params.rejectionReason,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { center, verifId };
   });
 
   return {
@@ -2515,11 +2737,9 @@ export async function requestCenterDocuments(params: {
     const resolvedCenterId =
       existingVerifs[0]?.centerId ?? params.idOrCenterId;
 
-    const [center] = await tx
-      .select()
-      .from(centers)
-      .where(eq(centers.id, resolvedCenterId))
-      .limit(1);
+    const [center] = await executeWithRowLock(
+      tx.select().from(centers).where(eq(centers.id, resolvedCenterId)).limit(1)
+    );
 
     if (!center) {
       throw new AdminAuthError(
@@ -2596,23 +2816,26 @@ export async function requestCenterDocuments(params: {
       createdAt: now,
     });
 
-    return { center, verifId };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "CENTER_DOCUMENTS_REQUESTED",
+        entityType: "CENTER_VERIFICATION",
+        entityId: center.id,
+        summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) for centre "${center.name}"`,
+        previousState: { verificationStatus: center.verificationStatus },
+        newState: {
+          verificationStatus: "UNDER_REVIEW",
+          requestedDocuments: params.requestedDocuments,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "CENTER_DOCUMENTS_REQUESTED",
-    entityType: "CENTER_VERIFICATION",
-    entityId: txResult.center.id,
-    summary: `Requested additional documents (${params.requestedDocuments.join(", ")}) for centre "${txResult.center.name}"`,
-    previousState: { verificationStatus: txResult.center.verificationStatus },
-    newState: {
-      verificationStatus: "UNDER_REVIEW",
-      requestedDocuments: params.requestedDocuments,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { center, verifId };
   });
 
   return {
@@ -2677,7 +2900,9 @@ export async function listAdminCaregiverVerifications(filters: {
       const cgDocs = allDocs.filter(
         (d) =>
           d.caregiverId === cg.id ||
-          (verifRecord?.documentReferences ?? []).includes(d.id)
+          (Boolean(prov && d.providerId === prov.id) &&
+            (verifRecord?.documentReferences ?? []).includes(d.id) &&
+            (!d.caregiverId || d.caregiverId === cg.id))
       );
       const effectiveStatus = getEffectiveCaregiverStatus(cg, now);
       const validDocs = cgDocs.filter((d) => isDocumentCurrentlyValid(d, now));
@@ -2693,7 +2918,7 @@ export async function listAdminCaregiverVerifications(filters: {
         );
       } else if (validDocs.length === 0) {
         blockingReasons.push(
-          "Supporting caregiver screening document(s) must be individually VERIFIED and non-expired."
+          "Supporting caregiver screening document(s) must pass malware scan (CLEAN) and be individually VERIFIED and non-expired."
         );
       }
 
@@ -2749,6 +2974,12 @@ export async function listAdminCaregiverVerifications(filters: {
           id: d.id,
           documentType: d.documentType,
           documentTitle: d.documentTitle,
+          malwareScanStatus: (d.malwareScanStatus || "PENDING") as MalwareScanStatus,
+          malwareScanProvider: d.malwareScanProvider ?? null,
+          malwareScannedAt: d.malwareScannedAt
+            ? d.malwareScannedAt.toISOString()
+            : null,
+          quarantinedAt: d.quarantinedAt ? d.quarantinedAt.toISOString() : null,
           status:
             d.expiresAt && d.expiresAt <= now && d.status !== "REJECTED"
               ? "EXPIRED"
@@ -2822,12 +3053,23 @@ export async function approveCaregiverVerification(params: {
     );
   }
 
+  const submittedChecklist = params.checklistState ?? {};
+  for (const requiredKey of CAREGIVER_REQUIRED_CHECKLIST_KEYS) {
+    if (submittedChecklist[requiredKey] !== true) {
+      throw new AdminAuthError(
+        "CAREGIVER_CHECKLIST_INCOMPLETE",
+        `Mandatory caregiver screening checklist item '${requiredKey}' must be reviewed and confirmed (true).`,
+        400
+      );
+    }
+  }
+
   const now = new Date();
   const expiresAt = params.expiresAt
     ? new Date(params.expiresAt)
     : new Date(now.getTime() + 365 * 86_400_000);
 
-  if (expiresAt <= now) {
+  if (Number.isNaN(expiresAt.getTime()) || expiresAt <= now) {
     throw new AdminAuthError(
       "INVALID_EXPIRATION_DATE",
       "Caregiver verification expiration date must be in the future.",
@@ -2845,11 +3087,13 @@ export async function approveCaregiverVerification(params: {
     const resolvedCaregiverId =
       existingVerifs[0]?.caregiverId ?? params.idOrCaregiverId;
 
-    const [caregiver] = await tx
-      .select()
-      .from(caregivers)
-      .where(eq(caregivers.id, resolvedCaregiverId))
-      .limit(1);
+    const [caregiver] = await executeWithRowLock(
+      tx
+        .select()
+        .from(caregivers)
+        .where(eq(caregivers.id, resolvedCaregiverId))
+        .limit(1)
+    );
 
     if (!caregiver) {
       throw new AdminAuthError(
@@ -2916,7 +3160,8 @@ export async function approveCaregiverVerification(params: {
     const cgDocs = allProviderDocs.filter(
       (d) =>
         d.caregiverId === caregiver.id ||
-        (verifRecord?.documentReferences ?? []).includes(d.id)
+        ((verifRecord?.documentReferences ?? []).includes(d.id) &&
+          (!d.caregiverId || d.caregiverId === caregiver.id))
     );
 
     if (cgDocs.length === 0) {
@@ -2951,7 +3196,7 @@ export async function approveCaregiverVerification(params: {
     if (validDocs.length === 0 || validDocs.length < cgDocs.length) {
       throw new AdminAuthError(
         "CAREGIVER_DOCUMENTS_UNVERIFIED",
-        "All submitted caregiver screening documents must be individually VERIFIED before caregiver approval.",
+        "All submitted caregiver screening documents must complete malware scanning (CLEAN) and be individually VERIFIED before caregiver approval.",
         400
       );
     }
@@ -2993,7 +3238,7 @@ export async function approveCaregiverVerification(params: {
           reviewedAt: now,
           reviewComments: trimmedComments,
           rejectionReason: null,
-          checklistState: params.checklistState ?? verifRecord.checklistState,
+          checklistState: submittedChecklist,
           expiresAt,
           updatedAt: now,
         })
@@ -3011,7 +3256,7 @@ export async function approveCaregiverVerification(params: {
           reviewedAt: now,
           reviewComments: trimmedComments,
           documentReferences: validDocs.map((d) => d.id),
-          checklistState: params.checklistState ?? {},
+          checklistState: submittedChecklist,
           expiresAt,
           createdAt: now,
           updatedAt: now,
@@ -3037,25 +3282,28 @@ export async function approveCaregiverVerification(params: {
       createdAt: now,
     });
 
-    return { caregiver, verifId };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "CAREGIVER_VERIFICATION_APPROVED",
+        entityType: "CAREGIVER_VERIFICATION",
+        entityId: caregiver.id,
+        summary: `Verified caregiver screening for ${caregiver.fullName} (${caregiver.email}). Comments: ${trimmedComments}`,
+        previousState: {
+          backgroundCheckStatus: caregiver.backgroundCheckStatus,
+        },
+        newState: {
+          backgroundCheckStatus: "VERIFIED",
+          verificationExpiresAt: expiresAt.toISOString(),
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "CAREGIVER_VERIFICATION_APPROVED",
-    entityType: "CAREGIVER_VERIFICATION",
-    entityId: txResult.caregiver.id,
-    summary: `Verified caregiver screening for ${txResult.caregiver.fullName} (${txResult.caregiver.email}). Comments: ${trimmedComments}`,
-    previousState: {
-      backgroundCheckStatus: txResult.caregiver.backgroundCheckStatus,
-    },
-    newState: {
-      backgroundCheckStatus: "VERIFIED",
-      verificationExpiresAt: expiresAt.toISOString(),
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { caregiver, verifId };
   });
 
   return {
@@ -3092,11 +3340,13 @@ export async function rejectCaregiverVerification(params: {
     const resolvedCaregiverId =
       existingVerifs[0]?.caregiverId ?? params.idOrCaregiverId;
 
-    const [caregiver] = await tx
-      .select()
-      .from(caregivers)
-      .where(eq(caregivers.id, resolvedCaregiverId))
-      .limit(1);
+    const [caregiver] = await executeWithRowLock(
+      tx
+        .select()
+        .from(caregivers)
+        .where(eq(caregivers.id, resolvedCaregiverId))
+        .limit(1)
+    );
 
     if (!caregiver) {
       throw new AdminAuthError(
@@ -3206,27 +3456,30 @@ export async function rejectCaregiverVerification(params: {
       createdAt: now,
     });
 
-    return { caregiver, verifId };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: params.suspendCaregiver
+          ? "CAREGIVER_VERIFICATION_SUSPENDED"
+          : "CAREGIVER_VERIFICATION_REJECTED",
+        entityType: "CAREGIVER_VERIFICATION",
+        entityId: caregiver.id,
+        summary: `${nextStatus} caregiver screening for ${caregiver.fullName}. Reason: ${params.rejectionReason}`,
+        previousState: {
+          backgroundCheckStatus: caregiver.backgroundCheckStatus,
+        },
+        newState: {
+          backgroundCheckStatus: nextStatus,
+          rejectionReason: params.rejectionReason,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: params.suspendCaregiver
-      ? "CAREGIVER_VERIFICATION_SUSPENDED"
-      : "CAREGIVER_VERIFICATION_REJECTED",
-    entityType: "CAREGIVER_VERIFICATION",
-    entityId: txResult.caregiver.id,
-    summary: `${nextStatus} caregiver screening for ${txResult.caregiver.fullName}. Reason: ${params.rejectionReason}`,
-    previousState: {
-      backgroundCheckStatus: txResult.caregiver.backgroundCheckStatus,
-    },
-    newState: {
-      backgroundCheckStatus: nextStatus,
-      rejectionReason: params.rejectionReason,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { caregiver, verifId };
   });
 
   return {
@@ -3276,6 +3529,14 @@ export async function listAdminVerificationDocuments(filters: {
         isExpired && d.status !== "REJECTED"
           ? "EXPIRED"
           : (d.status as DocumentVerificationStatus);
+      const scanStatus = (d.malwareScanStatus || "PENDING") as MalwareScanStatus;
+      const hasTrustedScan =
+        scanStatus === "CLEAN" &&
+        !d.quarantinedAt &&
+        Boolean(d.malwareScannedAt) &&
+        Boolean(d.malwareScanProvider);
+      const contentAvailable =
+        hasTrustedScan && isManagedPrivateStorageReference(d.storageReference);
 
       return {
         id: d.id,
@@ -3290,10 +3551,19 @@ export async function listAdminVerificationDocuments(filters: {
           (d.caregiverId ? "CAREGIVER" : d.centerId ? "CENTER" : "PROVIDER"),
         documentType: d.documentType,
         documentTitle: d.documentTitle,
+        originalFileName: d.originalFileName ?? null,
         mimeType: d.mimeType,
         fileSizeBytes: d.fileSizeBytes,
         checksumSha256: d.checksumSha256,
-        malwareScanStatus: d.malwareScanStatus ?? "CLEAN",
+        malwareScanStatus: scanStatus,
+        malwareScanProvider: d.malwareScanProvider ?? null,
+        malwareScannedAt: d.malwareScannedAt
+          ? d.malwareScannedAt.toISOString()
+          : null,
+        malwareScanResult: d.malwareScanResult ?? null,
+        quarantinedAt: d.quarantinedAt ? d.quarantinedAt.toISOString() : null,
+        scannerConfigured: isMalwareScannerConfigured(),
+        contentAvailable,
         status: effectiveStatus,
         isExpired,
         expiresAt: d.expiresAt ? d.expiresAt.toISOString() : null,
@@ -3335,25 +3605,58 @@ export async function listAdminVerificationDocuments(filters: {
     });
 }
 
-export async function getAdminVerificationDocumentById(docId: string) {
-  const [docs, historyRows] = await Promise.all([
-    listAdminVerificationDocuments({}),
+export async function getAdminVerificationDocumentById(
+  docId: string,
+  adminId?: string
+) {
+  const [rawDocRows, historyRows, docs] = await Promise.all([
+    db
+      .select()
+      .from(verificationDocuments)
+      .where(eq(verificationDocuments.id, docId))
+      .limit(1),
     safeSelectTable(() =>
       db
         .select()
         .from(verificationReviewHistory)
         .orderBy(desc(verificationReviewHistory.createdAt))
     ),
+    listAdminVerificationDocuments({}),
   ]);
 
+  const rawDoc = rawDocRows[0];
   const doc = docs.find((d) => d.id === docId);
-  if (!doc) {
+  if (!doc || !rawDoc) {
     throw new AdminAuthError(
       "DOCUMENT_NOT_FOUND",
       "Verification document not found.",
       404
     );
   }
+
+  let contentAvailable = doc.contentAvailable;
+  if (contentAvailable) {
+    const accessibility = await verifyStoredDocumentAccessible(
+      rawDoc.storageReference,
+      rawDoc.checksumSha256
+    );
+    contentAvailable = accessibility.accessible;
+  }
+
+  const canSignAccess = Boolean(
+    adminId &&
+      doc.malwareScanStatus === "CLEAN" &&
+      !doc.quarantinedAt &&
+      doc.malwareScannedAt &&
+      doc.malwareScanProvider &&
+      contentAvailable
+  );
+
+  const signedAccessUrl = canSignAccess
+    ? `/api/v1/admin/verification-documents/${doc.id}/content?token=${encodeURIComponent(
+        createSignedDocumentAccessToken(doc.id, adminId as string, 300)
+      )}`
+    : null;
 
   const history = historyRows
     .filter((h) => h.subjectType === "DOCUMENT" && h.subjectId === doc.id)
@@ -3370,13 +3673,17 @@ export async function getAdminVerificationDocumentById(docId: string) {
 
   return {
     ...doc,
+    contentAvailable,
+    signedAccessUrl,
     history,
+    reviewHistory: history,
   };
 }
 
 export async function approveVerificationDocument(params: {
   documentId: string;
   reviewNotes: string;
+  evidenceReviewed: boolean;
   expiresAt?: string;
   admin: AuthenticatedAdmin;
   ipAddress?: string;
@@ -3391,14 +3698,34 @@ export async function approveVerificationDocument(params: {
     );
   }
 
+  if (params.evidenceReviewed !== true) {
+    throw new AdminAuthError(
+      "DOCUMENT_EVIDENCE_REVIEW_REQUIRED",
+      "Explicit confirmation that document content has been inspected (evidenceReviewed: true) is required before verifying a document.",
+      400
+    );
+  }
+
   const now = new Date();
+  if (params.expiresAt) {
+    const parsedExp = new Date(params.expiresAt);
+    if (Number.isNaN(parsedExp.getTime())) {
+      throw new AdminAuthError(
+        "INVALID_EXPIRATION_DATE",
+        "Provided document expiration timestamp is invalid.",
+        400
+      );
+    }
+  }
 
   const txResult = await db.transaction(async (tx) => {
-    const [doc] = await tx
-      .select()
-      .from(verificationDocuments)
-      .where(eq(verificationDocuments.id, params.documentId))
-      .limit(1);
+    const [doc] = await executeWithRowLock(
+      tx
+        .select()
+        .from(verificationDocuments)
+        .where(eq(verificationDocuments.id, params.documentId))
+        .limit(1)
+    );
 
     if (!doc) {
       throw new AdminAuthError(
@@ -3434,21 +3761,39 @@ export async function approveVerificationDocument(params: {
     }
 
     if (
-      doc.fileSizeBytes < 0 ||
+      doc.fileSizeBytes <= 0 ||
       doc.fileSizeBytes > MAX_DOCUMENT_SIZE_BYTES
     ) {
       throw new AdminAuthError(
         "INVALID_DOCUMENT_SIZE",
-        "Document file size is outside allowed compliance bounds (max 10 MB).",
+        "Document file size is outside allowed compliance bounds (1B – 10 MB).",
         400
       );
     }
 
-    const scanStatus = doc.malwareScanStatus ?? "CLEAN";
-    if (scanStatus !== "CLEAN") {
+    const scanStatus = (doc.malwareScanStatus || "PENDING") as MalwareScanStatus;
+    if (
+      Boolean(doc.quarantinedAt) ||
+      scanStatus !== "CLEAN" ||
+      !doc.malwareScannedAt ||
+      !doc.malwareScanProvider
+    ) {
       throw new AdminAuthError(
         "DOCUMENT_MALWARE_SCAN_REQUIRED",
-        `Document cannot be verified until malware scanning completes with status CLEAN (current: ${scanStatus}).`,
+        `Document cannot be verified until trusted backend malware scanning completes with status CLEAN (current: ${scanStatus}${doc.quarantinedAt ? ", QUARANTINED" : ""}).`,
+        400
+      );
+    }
+
+    const contentCheck = await verifyStoredDocumentAccessible(
+      doc.storageReference,
+      doc.checksumSha256
+    );
+    if (!contentCheck.accessible) {
+      throw new AdminAuthError(
+        "DOCUMENT_CONTENT_UNAVAILABLE",
+        contentCheck.reason ||
+          "Stored document content is inaccessible or failed integrity verification.",
         400
       );
     }
@@ -3518,27 +3863,34 @@ export async function approveVerificationDocument(params: {
       evidenceSnapshot: {
         documentType: doc.documentType,
         checksumSha256: doc.checksumSha256,
+        malwareScanProvider: doc.malwareScanProvider,
+        malwareScannedAt: doc.malwareScannedAt?.toISOString() ?? null,
+        evidenceReviewed: true,
       },
       createdAt: now,
     });
 
-    return { doc, nextExpiresAt };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "VERIFICATION_DOCUMENT_APPROVED",
+        entityType: "VERIFICATION_DOCUMENT",
+        entityId: doc.id,
+        summary: `Verified document "${doc.documentTitle}" (${doc.documentType}). Notes: ${trimmedNotes}`,
+        previousState: { status: doc.status },
+        newState: {
+          status: "VERIFIED",
+          documentType: doc.documentType,
+          malwareScanProvider: doc.malwareScanProvider,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "VERIFICATION_DOCUMENT_APPROVED",
-    entityType: "VERIFICATION_DOCUMENT",
-    entityId: txResult.doc.id,
-    summary: `Verified document "${txResult.doc.documentTitle}" (${txResult.doc.documentType}). Notes: ${trimmedNotes}`,
-    previousState: { status: txResult.doc.status },
-    newState: {
-      status: "VERIFIED",
-      documentType: txResult.doc.documentType,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { doc, nextExpiresAt };
   });
 
   return {
@@ -3561,11 +3913,13 @@ export async function rejectVerificationDocument(params: {
   const now = new Date();
 
   const txResult = await db.transaction(async (tx) => {
-    const [doc] = await tx
-      .select()
-      .from(verificationDocuments)
-      .where(eq(verificationDocuments.id, params.documentId))
-      .limit(1);
+    const [doc] = await executeWithRowLock(
+      tx
+        .select()
+        .from(verificationDocuments)
+        .where(eq(verificationDocuments.id, params.documentId))
+        .limit(1)
+    );
 
     if (!doc) {
       throw new AdminAuthError(
@@ -3636,24 +3990,27 @@ export async function rejectVerificationDocument(params: {
       createdAt: now,
     });
 
-    return { doc };
-  });
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "VERIFICATION_DOCUMENT_REJECTED",
+        entityType: "VERIFICATION_DOCUMENT",
+        entityId: doc.id,
+        summary: `Rejected document "${doc.documentTitle}" (${doc.documentType}). Reason: ${params.rejectionReason}`,
+        previousState: { status: doc.status },
+        newState: {
+          status: "REJECTED",
+          rejectionReason: params.rejectionReason,
+          replacementRequested: Boolean(params.requestReplacement ?? true),
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "VERIFICATION_DOCUMENT_REJECTED",
-    entityType: "VERIFICATION_DOCUMENT",
-    entityId: txResult.doc.id,
-    summary: `Rejected document "${txResult.doc.documentTitle}" (${txResult.doc.documentType}). Reason: ${params.rejectionReason}`,
-    previousState: { status: txResult.doc.status },
-    newState: {
-      status: "REJECTED",
-      rejectionReason: params.rejectionReason,
-      replacementRequested: Boolean(params.requestReplacement ?? true),
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    return { doc };
   });
 
   return {
@@ -3871,117 +4228,134 @@ export async function transitionAdminBookingStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [booking] = await db
-    .select()
-    .from(bookings)
-    .where(eq(bookings.id, params.bookingId))
-    .limit(1);
-
-  if (!booking) {
-    throw new AdminAuthError("BOOKING_NOT_FOUND", "Booking not found.", 404);
-  }
-
-  const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.status] ?? [];
-  if (!allowed.includes(params.toStatus)) {
-    throw new AdminAuthError(
-      "INVALID_BOOKING_STATE_TRANSITION",
-      `Invalid booking state transition from ${booking.status} to ${params.toStatus}. Allowed transitions: ${allowed.join(", ") || "none"}.`,
-      400
+  const bookingId = await db.transaction(async (tx) => {
+    const [booking] = await executeWithRowLock(
+      tx
+        .select()
+        .from(bookings)
+        .where(eq(bookings.id, params.bookingId))
+        .limit(1)
     );
-  }
 
-  const [center] = await db
-    .select()
-    .from(centers)
-    .where(eq(centers.id, booking.centerId))
-    .limit(1);
+    if (!booking) {
+      throw new AdminAuthError("BOOKING_NOT_FOUND", "Booking not found.", 404);
+    }
 
-  if (!center) {
-    throw new AdminAuthError("CENTER_NOT_FOUND", "Centre not found.", 404);
-  }
-
-  // Prevent suspended, rejected, or unverified centres from accepting or confirming bookings
-  if (params.toStatus === "CONFIRMED" || params.toStatus === "CHECKED_IN") {
-    if (
-      center.listingStatus !== "ACTIVE" ||
-      center.verificationStatus !== "APPROVED"
-    ) {
+    const allowed = ALLOWED_BOOKING_TRANSITIONS[booking.status] ?? [];
+    if (!allowed.includes(params.toStatus)) {
       throw new AdminAuthError(
-        "CENTER_UNAVAILABLE_FOR_BOOKING",
-        `Cannot confirm or check in booking: ${center.name} is not an active, approved centre (listingStatus=${center.listingStatus}, verificationStatus=${center.verificationStatus}).`,
+        "INVALID_BOOKING_STATE_TRANSITION",
+        `Invalid booking state transition from ${booking.status} to ${params.toStatus}. Allowed transitions: ${allowed.join(", ") || "none"}.`,
         400
       );
     }
 
-    const [centerProvider] = await db
+    const [center] = await tx
       .select()
-      .from(providers)
-      .where(eq(providers.id, center.providerId))
+      .from(centers)
+      .where(eq(centers.id, booking.centerId))
       .limit(1);
 
+    if (!center) {
+      throw new AdminAuthError("CENTER_NOT_FOUND", "Centre not found.", 404);
+    }
+
+    // Prevent suspended, rejected, or unverified centres from accepting or confirming bookings
+    if (params.toStatus === "CONFIRMED" || params.toStatus === "CHECKED_IN") {
+      if (
+        center.listingStatus !== "ACTIVE" ||
+        center.verificationStatus !== "APPROVED"
+      ) {
+        throw new AdminAuthError(
+          "CENTER_UNAVAILABLE_FOR_BOOKING",
+          `Cannot confirm or check in booking: ${center.name} is not an active, approved centre (listingStatus=${center.listingStatus}, verificationStatus=${center.verificationStatus}).`,
+          400
+        );
+      }
+
+      const [centerProvider] = await tx
+        .select()
+        .from(providers)
+        .where(eq(providers.id, center.providerId))
+        .limit(1);
+
+      if (
+        !centerProvider ||
+        centerProvider.verificationStatus !== "APPROVED" ||
+        !centerProvider.subscriptionActive
+      ) {
+        throw new AdminAuthError(
+          "CENTER_UNAVAILABLE_FOR_BOOKING",
+          `Cannot confirm or check in booking: parent provider for ${center.name} is not active and approved.`,
+          400
+        );
+      }
+    }
+
+    // Enforce childcare capacity constraint when confirming or checking in
     if (
-      !centerProvider ||
-      centerProvider.verificationStatus !== "APPROVED" ||
-      !centerProvider.subscriptionActive
+      (params.toStatus === "CONFIRMED" || params.toStatus === "CHECKED_IN") &&
+      booking.status === "REQUESTED" &&
+      center.currentOccupancy >= center.approvedCapacity
     ) {
       throw new AdminAuthError(
-        "CENTER_UNAVAILABLE_FOR_BOOKING",
-        `Cannot confirm or check in booking: parent provider for ${center.name} is not active and approved.`,
+        "CAPACITY_LIMIT_EXCEEDED",
+        `Cannot confirm booking: ${center.name} is at full approved capacity (${center.currentOccupancy}/${center.approvedCapacity}).`,
         400
       );
     }
-  }
 
-  // Enforce childcare capacity constraint when confirming or checking in
-  if (
-    (params.toStatus === "CONFIRMED" || params.toStatus === "CHECKED_IN") &&
-    booking.status === "REQUESTED" &&
-    center.currentOccupancy >= center.approvedCapacity
-  ) {
-    throw new AdminAuthError(
-      "CAPACITY_LIMIT_EXCEEDED",
-      `Cannot confirm booking: ${center.name} is at full approved capacity (${center.currentOccupancy}/${center.approvedCapacity}).`,
-      400
+    const now = new Date();
+    const updatedBookings = await tx
+      .update(bookings)
+      .set({
+        status: params.toStatus,
+        cancellationReason:
+          params.toStatus === "CANCELLED" || params.toStatus === "REJECTED"
+            ? params.reason
+            : booking.cancellationReason,
+        updatedAt: now,
+      })
+      .where(and(eq(bookings.id, booking.id), eq(bookings.status, booking.status)))
+      .returning({ id: bookings.id });
+
+    if (updatedBookings.length === 0) {
+      throw new AdminAuthError(
+        "BOOKING_TRANSITION_CONFLICT",
+        "Concurrent booking status transition detected.",
+        409
+      );
+    }
+
+    await tx.insert(bookingStatusHistory).values({
+      bookingId: booking.id,
+      fromStatus: booking.status,
+      toStatus: params.toStatus,
+      changedBy: params.admin.id,
+      reason: params.reason,
+      createdAt: now,
+    });
+
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "BOOKING_STATUS_TRANSITIONED",
+        entityType: "BOOKING",
+        entityId: booking.id,
+        summary: `Transitioned booking ${booking.bookingReference} from ${booking.status} to ${params.toStatus}. Reason: ${params.reason}`,
+        previousState: { status: booking.status },
+        newState: { status: params.toStatus, reason: params.reason },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
     );
-  }
 
-  const now = new Date();
-  await db
-    .update(bookings)
-    .set({
-      status: params.toStatus,
-      cancellationReason:
-        params.toStatus === "CANCELLED" || params.toStatus === "REJECTED"
-          ? params.reason
-          : booking.cancellationReason,
-      updatedAt: now,
-    })
-    .where(eq(bookings.id, booking.id));
-
-  await db.insert(bookingStatusHistory).values({
-    bookingId: booking.id,
-    fromStatus: booking.status,
-    toStatus: params.toStatus,
-    changedBy: params.admin.id,
-    reason: params.reason,
-    createdAt: now,
+    return booking.id;
   });
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "BOOKING_STATUS_TRANSITIONED",
-    entityType: "BOOKING",
-    entityId: booking.id,
-    summary: `Transitioned booking ${booking.bookingReference} from ${booking.status} to ${params.toStatus}. Reason: ${params.reason}`,
-    previousState: { status: booking.status },
-    newState: { status: params.toStatus, reason: params.reason },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
-  });
-
-  return getAdminBookingById(booking.id);
+  return getAdminBookingById(bookingId);
 }
 
 // ==========================================
@@ -4161,69 +4535,77 @@ export async function updateAdminIncidentStatus(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [incident] = await db
-    .select()
-    .from(safetyIncidents)
-    .where(eq(safetyIncidents.id, params.incidentId))
-    .limit(1);
-
-  if (!incident) {
-    throw new AdminAuthError(
-      "INCIDENT_NOT_FOUND",
-      "Safety incident record not found.",
-      404
+  const incidentId = await db.transaction(async (tx) => {
+    const [incident] = await executeWithRowLock(
+      tx
+        .select()
+        .from(safetyIncidents)
+        .where(eq(safetyIncidents.id, params.incidentId))
+        .limit(1)
     );
-  }
 
-  const now = new Date();
-  const isResolving =
-    params.status === "RESOLVED" || params.status === "CLOSED";
+    if (!incident) {
+      throw new AdminAuthError(
+        "INCIDENT_NOT_FOUND",
+        "Safety incident record not found.",
+        404
+      );
+    }
 
-  await db
-    .update(safetyIncidents)
-    .set({
-      status: params.status,
-      assignedAdminId:
-        params.assignedAdminId !== undefined
-          ? params.assignedAdminId
-          : incident.assignedAdminId,
-      resolutionOutcome:
-        params.resolutionOutcome !== undefined
-          ? params.resolutionOutcome
-          : incident.resolutionOutcome,
-      resolvedAt: isResolving ? now : incident.resolvedAt,
-      updatedAt: now,
-    })
-    .where(eq(safetyIncidents.id, incident.id));
+    const now = new Date();
+    const isResolving =
+      params.status === "RESOLVED" || params.status === "CLOSED";
 
-  await db.insert(incidentActivity).values({
-    incidentId: incident.id,
-    actorId: params.admin.id,
-    actionType: isResolving ? "RESOLUTION_RECORDED" : "STATUS_CHANGED",
-    fromStatus: incident.status,
-    toStatus: params.status,
-    note: params.note,
-    createdAt: now,
+    await tx
+      .update(safetyIncidents)
+      .set({
+        status: params.status,
+        assignedAdminId:
+          params.assignedAdminId !== undefined
+            ? params.assignedAdminId
+            : incident.assignedAdminId,
+        resolutionOutcome:
+          params.resolutionOutcome !== undefined
+            ? params.resolutionOutcome
+            : incident.resolutionOutcome,
+        resolvedAt: isResolving ? now : incident.resolvedAt,
+        updatedAt: now,
+      })
+      .where(eq(safetyIncidents.id, incident.id));
+
+    await tx.insert(incidentActivity).values({
+      incidentId: incident.id,
+      actorId: params.admin.id,
+      actionType: isResolving ? "RESOLUTION_RECORDED" : "STATUS_CHANGED",
+      fromStatus: incident.status,
+      toStatus: params.status,
+      note: params.note,
+      createdAt: now,
+    });
+
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "INCIDENT_STATUS_UPDATED",
+        entityType: "SAFETY_INCIDENT",
+        entityId: incident.id,
+        summary: `Updated incident ${incident.incidentReference} from ${incident.status} to ${params.status}. Note: ${params.note}`,
+        previousState: { status: incident.status },
+        newState: {
+          status: params.status,
+          resolutionOutcome: params.resolutionOutcome,
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
+
+    return incident.id;
   });
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "INCIDENT_STATUS_UPDATED",
-    entityType: "SAFETY_INCIDENT",
-    entityId: incident.id,
-    summary: `Updated incident ${incident.incidentReference} from ${incident.status} to ${params.status}. Note: ${params.note}`,
-    previousState: { status: incident.status },
-    newState: {
-      status: params.status,
-      resolutionOutcome: params.resolutionOutcome,
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
-  });
-
-  return getAdminIncidentById(incident.id);
+  return getAdminIncidentById(incidentId);
 }
 
 export async function addAdminIncidentNote(params: {
@@ -4234,56 +4616,64 @@ export async function addAdminIncidentNote(params: {
   ipAddress?: string;
   userAgent?: string;
 }) {
-
-  const [incident] = await db
-    .select()
-    .from(safetyIncidents)
-    .where(eq(safetyIncidents.id, params.incidentId))
-    .limit(1);
-
-  if (!incident) {
-    throw new AdminAuthError(
-      "INCIDENT_NOT_FOUND",
-      "Safety incident record not found.",
-      404
+  const incidentId = await db.transaction(async (tx) => {
+    const [incident] = await executeWithRowLock(
+      tx
+        .select()
+        .from(safetyIncidents)
+        .where(eq(safetyIncidents.id, params.incidentId))
+        .limit(1)
     );
-  }
 
-  const now = new Date();
+    if (!incident) {
+      throw new AdminAuthError(
+        "INCIDENT_NOT_FOUND",
+        "Safety incident record not found.",
+        404
+      );
+    }
 
-  if (params.assignedAdminId) {
-    await db
-      .update(safetyIncidents)
-      .set({
-        assignedAdminId: params.assignedAdminId,
-        updatedAt: now,
-      })
-      .where(eq(safetyIncidents.id, incident.id));
-  }
+    const now = new Date();
 
-  await db.insert(incidentActivity).values({
-    incidentId: incident.id,
-    actorId: params.admin.id,
-    actionType: params.assignedAdminId ? "ASSIGNED" : "NOTE_ADDED",
-    fromStatus: incident.status,
-    toStatus: incident.status,
-    note: params.note,
-    createdAt: now,
+    if (params.assignedAdminId) {
+      await tx
+        .update(safetyIncidents)
+        .set({
+          assignedAdminId: params.assignedAdminId,
+          updatedAt: now,
+        })
+        .where(eq(safetyIncidents.id, incident.id));
+    }
+
+    await tx.insert(incidentActivity).values({
+      incidentId: incident.id,
+      actorId: params.admin.id,
+      actionType: params.assignedAdminId ? "ASSIGNED" : "NOTE_ADDED",
+      fromStatus: incident.status,
+      toStatus: incident.status,
+      note: params.note,
+      createdAt: now,
+    });
+
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "INCIDENT_NOTE_ADDED",
+        entityType: "SAFETY_INCIDENT",
+        entityId: incident.id,
+        summary: `Added investigation note to incident ${incident.incidentReference}`,
+        newState: { note: params.note },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
+
+    return incident.id;
   });
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "INCIDENT_NOTE_ADDED",
-    entityType: "SAFETY_INCIDENT",
-    entityId: incident.id,
-    summary: `Added investigation note to incident ${incident.incidentReference}`,
-    newState: { note: params.note },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
-  });
-
-  return getAdminIncidentById(incident.id);
+  return getAdminIncidentById(incidentId);
 }
 
 // ==========================================
@@ -4477,60 +4867,67 @@ export async function updateAdminPlatformSettings(params: {
 }) {
   const now = new Date();
 
-  for (const item of params.settings) {
-    if (
-      item.settingKey.startsWith("ratelimit:") ||
-      item.category === "RATE_LIMIT_INTERNAL"
-    ) {
-      throw new AdminAuthError(
-        "RESERVED_SETTING_KEY",
-        "Cannot modify internal rate-limiting state through platform settings.",
-        400
+  await db.transaction(async (tx) => {
+    for (const item of params.settings) {
+      if (
+        item.settingKey.startsWith("ratelimit:") ||
+        item.category === "RATE_LIMIT_INTERNAL"
+      ) {
+        throw new AdminAuthError(
+          "RESERVED_SETTING_KEY",
+          "Cannot modify internal rate-limiting state through platform settings.",
+          400
+        );
+      }
+      const [existing] = await executeWithRowLock(
+        tx
+          .select()
+          .from(platformSettings)
+          .where(eq(platformSettings.settingKey, item.settingKey))
+          .limit(1)
       );
-    }
-    const [existing] = await db
-      .select()
-      .from(platformSettings)
-      .where(eq(platformSettings.settingKey, item.settingKey))
-      .limit(1);
 
-    if (existing) {
-      await db
-        .update(platformSettings)
-        .set({
+      if (existing) {
+        await tx
+          .update(platformSettings)
+          .set({
+            settingValue: item.settingValue,
+            category: item.category ?? existing.category,
+            description: item.description ?? existing.description,
+            updatedByAdminId: params.admin.id,
+            updatedAt: now,
+          })
+          .where(eq(platformSettings.id, existing.id));
+      } else {
+        await tx.insert(platformSettings).values({
+          settingKey: item.settingKey,
           settingValue: item.settingValue,
-          category: item.category ?? existing.category,
-          description: item.description ?? existing.description,
+          category: item.category ?? "GENERAL",
+          description: item.description ?? "",
           updatedByAdminId: params.admin.id,
           updatedAt: now,
-        })
-        .where(eq(platformSettings.id, existing.id));
-    } else {
-      await db.insert(platformSettings).values({
-        settingKey: item.settingKey,
-        settingValue: item.settingValue,
-        category: item.category ?? "GENERAL",
-        description: item.description ?? "",
-        updatedByAdminId: params.admin.id,
-        updatedAt: now,
-      });
+        });
+      }
     }
-  }
 
-  await recordAdminAuditLog({
-    adminUserId: params.admin.id,
-    adminEmail: params.admin.email,
-    action: "PLATFORM_SETTINGS_UPDATED",
-    entityType: "PLATFORM_SETTINGS",
-    summary: `Updated ${params.settings.length} platform setting(s): ${params.settings.map((s) => s.settingKey).join(", ")}`,
-    newState: {
-      updatedKeys: params.settings.map((s) => ({
-        key: s.settingKey,
-        value: s.settingValue,
-      })),
-    },
-    ipAddress: params.ipAddress,
-    userAgent: params.userAgent,
+    await recordAdminAuditLog(
+      {
+        adminUserId: params.admin.id,
+        adminEmail: params.admin.email,
+        action: "PLATFORM_SETTINGS_UPDATED",
+        entityType: "PLATFORM_SETTINGS",
+        summary: `Updated ${params.settings.length} platform setting(s): ${params.settings.map((s) => s.settingKey).join(", ")}`,
+        newState: {
+          updatedKeys: params.settings.map((s) => ({
+            key: s.settingKey,
+            value: s.settingValue,
+          })),
+        },
+        ipAddress: params.ipAddress,
+        userAgent: params.userAgent,
+      },
+      tx
+    );
   });
 
   return getAdminPlatformSettings();
@@ -4569,5 +4966,37 @@ export async function inspectPhase2HistoricalDataImpact() {
     totalBookings: allBookings.length,
     unconfirmedPaidBookingCount: unconfirmedPaidBookings.length,
     totalAdminProfiles: allAdmins.length,
+  };
+}
+
+/**
+ * Read-only Phase 2.1 diagnostic report identifying historical `CLEAN` verification documents
+ * that lack backend malware scanner evidence or private managed storage.
+ */
+export async function inspectHistoricalCleanDocumentsImpact() {
+  const allDocs = await db.select().from(verificationDocuments);
+
+  const historicalUnscannedCleanDocs = allDocs.filter(
+    (d) =>
+      d.malwareScanStatus === "CLEAN" &&
+      (!d.malwareScannedAt || !d.malwareScanProvider)
+  );
+
+  const nonManagedStorageDocs = allDocs.filter(
+    (d) => !isManagedPrivateStorageReference(d.storageReference)
+  );
+
+  const quarantinedDocs = allDocs.filter(
+    (d) => d.malwareScanStatus === "INFECTED" || Boolean(d.quarantinedAt)
+  );
+
+  return {
+    totalDocuments: allDocs.length,
+    historicalUnscannedCleanCount: historicalUnscannedCleanDocs.length,
+    historicalUnscannedCleanIds: historicalUnscannedCleanDocs.map((d) => d.id),
+    nonManagedStorageCount: nonManagedStorageDocs.length,
+    nonManagedStorageIds: nonManagedStorageDocs.map((d) => d.id),
+    quarantinedCount: quarantinedDocs.length,
+    quarantinedIds: quarantinedDocs.map((d) => d.id),
   };
 }

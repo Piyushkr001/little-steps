@@ -15,6 +15,7 @@ export function StatusPill({ status }: { status: string }) {
       "RESOLVED",
       "VERIFIED",
       "PAID",
+      "CLEAN",
     ].includes(normalized)
   ) {
     colorClass =
@@ -22,6 +23,7 @@ export function StatusPill({ status }: { status: string }) {
   } else if (
     [
       "PENDING",
+      "SCANNING",
       "UNDER_REVIEW",
       "REQUESTED",
       "INVESTIGATING",
@@ -47,6 +49,9 @@ export function StatusPill({ status }: { status: string }) {
       "HIGH",
       "CRITICAL",
       "DISPUTED",
+      "INFECTED",
+      "ERROR",
+      "QUARANTINED",
     ].includes(normalized)
   ) {
     colorClass =

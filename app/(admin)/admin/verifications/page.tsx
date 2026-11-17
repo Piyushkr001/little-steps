@@ -7,11 +7,15 @@ import {
   Building2,
   CheckCircle2,
   ClipboardCheck,
+  ExternalLink,
+  Eye,
   FileCheck2,
   FilePlus2,
   History,
   RefreshCw,
+  ScanSearch,
   Search,
+  ShieldAlert,
   ShieldCheck,
   UserCheck,
   XCircle,
@@ -53,6 +57,25 @@ import { StatusPill } from "../_components/StatusBadges";
 
 type VerificationTab = "PROVIDERS" | "CENTERS" | "CAREGIVERS" | "DOCUMENTS";
 
+const INITIAL_PROVIDER_CHECKLIST = {
+  licenseVerified: false,
+  organizationDetailsVerified: false,
+};
+
+const INITIAL_CENTER_CHECKLIST = {
+  operatingLicenseVerified: false,
+  facilitySafetyVerified: false,
+  caregiverQualificationVerified: false,
+  capacityVerified: false,
+  operatingHoursVerified: false,
+  ageGroupsVerified: false,
+};
+
+const INITIAL_CAREGIVER_CHECKLIST = {
+  backgroundScreeningVerified: false,
+  credentialsVerified: false,
+};
+
 function VerificationsContent() {
   const searchParams = useSearchParams();
   const initialSearch = searchParams.get("search") || "";
@@ -84,8 +107,7 @@ function VerificationsContent() {
     "approve" | "reject" | "request-docs" | null
   >(null);
   const [providerChecklist, setProviderChecklist] = useState({
-    licenseVerified: true,
-    organizationDetailsVerified: true,
+    ...INITIAL_PROVIDER_CHECKLIST,
   });
 
   // Center dialog state
@@ -95,10 +117,7 @@ function VerificationsContent() {
     "approve" | "reject" | "request-docs" | null
   >(null);
   const [centerChecklist, setCenterChecklist] = useState({
-    operatingLicenseVerified: true,
-    facilitySafetyVerified: true,
-    caregiverQualificationVerified: true,
-    capacityVerified: true,
+    ...INITIAL_CENTER_CHECKLIST,
   });
 
   // Caregiver dialog state
@@ -107,13 +126,21 @@ function VerificationsContent() {
   const [caregiverDialogMode, setCaregiverDialogMode] = useState<
     "approve" | "reject" | null
   >(null);
+  const [caregiverChecklist, setCaregiverChecklist] = useState({
+    ...INITIAL_CAREGIVER_CHECKLIST,
+  });
 
-  // Document dialog state
+  // Document inspection & review dialog state
   const [activeDocument, setActiveDocument] =
     useState<AdminVerificationDocumentItem | null>(null);
+  const [inspectedDocument, setInspectedDocument] =
+    useState<AdminVerificationDocumentItem | null>(null);
+  const [docDetailLoading, setDocDetailLoading] = useState(false);
+  const [scanningDocId, setScanningDocId] = useState<string | null>(null);
   const [documentDialogMode, setDocumentDialogMode] = useState<
     "approve" | "reject" | null
   >(null);
+  const [evidenceReviewed, setEvidenceReviewed] = useState(false);
   const [replacementRequested, setReplacementRequested] = useState(true);
 
   // Shared modal fields
@@ -158,22 +185,47 @@ function VerificationsContent() {
     void Promise.resolve().then(loadAllQueues);
   }, [loadAllQueues]);
 
-  const handleQuickApproveDocument = async (
-    doc: AdminVerificationDocumentItem
+  const openDocumentReviewDialog = async (
+    doc: AdminVerificationDocumentItem,
+    mode: "approve" | "reject"
   ) => {
-    setSubmitting(true);
+    setError(null);
+    setActiveDocument(doc);
+    setInspectedDocument(doc);
+    setDocumentDialogMode(mode);
+    setEvidenceReviewed(false);
+    setComments("");
+    setRejectionReason("");
+    setReplacementRequested(true);
+    setDocDetailLoading(true);
+    try {
+      const fullDoc = await verificationDocuments.getById(doc.id);
+      setInspectedDocument(fullDoc);
+    } catch (err) {
+      setError(extractApiErrorMessage(err));
+    } finally {
+      setDocDetailLoading(false);
+    }
+  };
+
+  const handleScanDocument = async (docId: string) => {
+    setScanningDocId(docId);
     setError(null);
     setFeedback(null);
     try {
-      await verificationDocuments.approve(doc.id, {
-        reviewComments: `Individually verified ${doc.documentTitle} (${doc.documentType}).`,
-      });
-      setFeedback(`Verified document "${doc.documentTitle}".`);
+      const scanRes = await verificationDocuments.scan(docId);
+      setFeedback(
+        `Malware scan completed for document (${scanRes.malwareScanStatus}).`
+      );
+      if (inspectedDocument?.id === docId) {
+        const refreshed = await verificationDocuments.getById(docId);
+        setInspectedDocument(refreshed);
+      }
       await loadAllQueues();
     } catch (err) {
       setError(extractApiErrorMessage(err));
     } finally {
-      setSubmitting(false);
+      setScanningDocId(null);
     }
   };
 
@@ -285,10 +337,7 @@ function VerificationsContent() {
       if (caregiverDialogMode === "approve") {
         await caregiverVerifications.approve(activeCaregiver.caregiverId, {
           reviewComments: comments.trim(),
-          checklistState: {
-            backgroundScreeningVerified: true,
-            credentialsVerified: true,
-          },
+          checklistState: caregiverChecklist,
         });
         setFeedback(
           `Independently verified caregiver ${activeCaregiver.fullName}.`
@@ -323,19 +372,27 @@ function VerificationsContent() {
     setFeedback(null);
     try {
       if (documentDialogMode === "approve") {
+        if (!evidenceReviewed) {
+          throw new Error(
+            "Confirm that you have inspected the document content before verifying."
+          );
+        }
         await verificationDocuments.approve(activeDocument.id, {
-          reviewComments: comments.trim(),
+          reviewNotes: comments.trim(),
+          evidenceReviewed: true,
         });
         setFeedback(`Approved document "${activeDocument.documentTitle}".`);
       } else if (documentDialogMode === "reject") {
         await verificationDocuments.reject(activeDocument.id, {
           rejectionReason: rejectionReason.trim(),
-          reviewComments: comments.trim() || rejectionReason.trim(),
-          replacementRequested,
+          reviewNotes: comments.trim() || undefined,
+          requestReplacement: replacementRequested,
         });
         setFeedback(`Rejected document "${activeDocument.documentTitle}".`);
       }
       setActiveDocument(null);
+      setInspectedDocument(null);
+      setEvidenceReviewed(false);
       setDocumentDialogMode(null);
       setComments("");
       setRejectionReason("");
@@ -530,10 +587,12 @@ function VerificationsContent() {
                             }
                             onClick={() => {
                               setActiveProvider(v);
+                              setProviderChecklist({
+                                ...INITIAL_PROVIDER_CHECKLIST,
+                              });
+                              setComments("");
+                              setRejectionReason("");
                               setProviderDialogMode("approve");
-                              setComments(
-                                "Independently verified organization registration and compliance documents."
-                              );
                             }}
                             className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65] disabled:opacity-50"
                           >
@@ -615,21 +674,25 @@ function VerificationsContent() {
                                       • Scan: {doc.malwareScanStatus}
                                     </p>
                                   </div>
-                                  <div className="flex items-center gap-1.5">
+                                  <div className="flex flex-wrap items-center gap-1.5">
                                     <StatusPill status={doc.status} />
-                                    {doc.status !== "VERIFIED" && (
-                                      <Button
-                                        variant="outline"
-                                        size="xs"
-                                        disabled={submitting}
-                                        onClick={() =>
-                                          void handleQuickApproveDocument(doc)
-                                        }
-                                        className="h-6 px-2 text-[10px] text-[#087F78]"
-                                      >
-                                        Verify Doc
-                                      </Button>
-                                    )}
+                                    <StatusPill status={doc.malwareScanStatus} />
+                                    <Button
+                                      variant="outline"
+                                      size="xs"
+                                      onClick={() =>
+                                        void openDocumentReviewDialog(
+                                          doc,
+                                          "approve"
+                                        )
+                                      }
+                                      className="h-6 gap-1 px-2 text-[10px] text-[#087F78]"
+                                    >
+                                      <Eye className="size-3" />
+                                      {doc.status === "VERIFIED"
+                                        ? "Inspect Doc"
+                                        : "Review Doc"}
+                                    </Button>
                                   </div>
                                 </div>
                               ))}
@@ -757,10 +820,12 @@ function VerificationsContent() {
                             }
                             onClick={() => {
                               setActiveCenter(c);
+                              setCenterChecklist({
+                                ...INITIAL_CENTER_CHECKLIST,
+                              });
+                              setComments("");
+                              setRejectionReason("");
                               setCenterDialogMode("approve");
-                              setComments(
-                                "Verified facility safety inspection, operating capacity, and qualified caregiver staffing."
-                              );
                             }}
                             className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65] disabled:opacity-50"
                           >
@@ -906,10 +971,12 @@ function VerificationsContent() {
                             }
                             onClick={() => {
                               setActiveCaregiver(cg);
+                              setCaregiverChecklist({
+                                ...INITIAL_CAREGIVER_CHECKLIST,
+                              });
+                              setComments("");
+                              setRejectionReason("");
                               setCaregiverDialogMode("approve");
-                              setComments(
-                                "Verified background screening clearance and childcare certifications."
-                              );
                             }}
                             className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65] disabled:opacity-50"
                           >
@@ -969,6 +1036,7 @@ function VerificationsContent() {
                         {doc.documentTitle}
                       </span>
                       <StatusPill status={doc.status} />
+                      <StatusPill status={doc.malwareScanStatus} />
                       {doc.replacementRequested && (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
                           Replacement Requested
@@ -976,6 +1044,8 @@ function VerificationsContent() {
                       )}
                     </div>
                     <p className="text-xs text-muted-foreground">
+                      Category:{" "}
+                      <strong>{doc.documentCategory || "PROVIDER"}</strong> •
                       Type: <strong>{doc.documentType}</strong> • Provider:{" "}
                       {doc.providerName || doc.providerId}
                       {doc.centerName ? ` • Centre: ${doc.centerName}` : ""}
@@ -983,7 +1053,7 @@ function VerificationsContent() {
                         ? ` • Caregiver: ${doc.caregiverName}`
                         : ""}{" "}
                       • {Math.round(doc.fileSizeBytes / 1024)} KB •{" "}
-                      {doc.mimeType} • Malware Scan: {doc.malwareScanStatus}
+                      {doc.mimeType}
                     </p>
                     {doc.rejectionReason && (
                       <p className="text-xs font-medium text-rose-600">
@@ -992,30 +1062,38 @@ function VerificationsContent() {
                     )}
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    {doc.malwareScanStatus !== "CLEAN" &&
+                      doc.malwareScanStatus !== "INFECTED" && (
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          disabled={scanningDocId === doc.id}
+                          onClick={() => void handleScanDocument(doc.id)}
+                          className="gap-1 border-amber-300 text-amber-800 dark:text-amber-300"
+                        >
+                          <ScanSearch className="size-3.5" />
+                          {scanningDocId === doc.id ? "Scanning..." : "Scan"}
+                        </Button>
+                      )}
                     <Button
                       size="xs"
-                      disabled={doc.isExpired || doc.status === "VERIFIED"}
-                      onClick={() => {
-                        setActiveDocument(doc);
-                        setDocumentDialogMode("approve");
-                        setComments(
-                          `Verified authenticity and validity of ${doc.documentTitle}.`
-                        );
-                      }}
-                      className="bg-[#087F78] text-white hover:bg-[#066B65]"
+                      onClick={() =>
+                        void openDocumentReviewDialog(doc, "approve")
+                      }
+                      className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65]"
                     >
-                      Approve Doc
+                      <Eye className="size-3.5" />
+                      {doc.status === "VERIFIED"
+                        ? "Inspect Doc"
+                        : "Inspect & Review"}
                     </Button>
                     <Button
                       variant="destructive"
                       size="xs"
-                      onClick={() => {
-                        setActiveDocument(doc);
-                        setDocumentDialogMode("reject");
-                        setRejectionReason("");
-                        setReplacementRequested(true);
-                      }}
+                      onClick={() =>
+                        void openDocumentReviewDialog(doc, "reject")
+                      }
                     >
                       Reject Doc
                     </Button>
@@ -1037,7 +1115,7 @@ function VerificationsContent() {
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
               {providerDialogMode === "approve" &&
@@ -1155,7 +1233,13 @@ function VerificationsContent() {
               </Button>
               <Button
                 type="submit"
-                disabled={submitting}
+                disabled={
+                  submitting ||
+                  (providerDialogMode === "approve" &&
+                    (!providerChecklist.licenseVerified ||
+                      !providerChecklist.organizationDetailsVerified ||
+                      comments.trim().length < 3))
+                }
                 className={
                   providerDialogMode === "reject"
                     ? "bg-rose-600 text-white hover:bg-rose-700"
@@ -1179,7 +1263,7 @@ function VerificationsContent() {
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
               {centerDialogMode === "approve" &&
@@ -1214,7 +1298,15 @@ function VerificationsContent() {
                     ],
                     [
                       "capacityVerified",
-                      "Approved childcare capacity & age groups verified",
+                      "Approved childcare capacity confirmed",
+                    ],
+                    [
+                      "operatingHoursVerified",
+                      "Declared 24x7 / operating hours schedule verified",
+                    ],
+                    [
+                      "ageGroupsVerified",
+                      "Supported child age groups & care scope verified",
                     ],
                   ] as const
                 ).map(([key, label]) => (
@@ -1283,6 +1375,7 @@ function VerificationsContent() {
                 minLength={3}
                 value={comments}
                 onChange={(e) => setComments(e.target.value)}
+                placeholder="Enter reviewer notes..."
               />
             </div>
 
@@ -1299,8 +1392,17 @@ function VerificationsContent() {
               </Button>
               <Button
                 type="submit"
-                disabled={submitting}
-                className="bg-[#087F78] text-white hover:bg-[#066B65]"
+                disabled={
+                  submitting ||
+                  (centerDialogMode === "approve" &&
+                    (!Object.values(centerChecklist).every(Boolean) ||
+                      comments.trim().length < 3))
+                }
+                className={
+                  centerDialogMode === "reject"
+                    ? "bg-rose-600 text-white hover:bg-rose-700"
+                    : "bg-[#087F78] text-white hover:bg-[#066B65]"
+                }
               >
                 {submitting ? "Submitting..." : "Confirm Decision"}
               </Button>
@@ -1319,7 +1421,7 @@ function VerificationsContent() {
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
               {caregiverDialogMode === "approve"
@@ -1332,6 +1434,40 @@ function VerificationsContent() {
           </DialogHeader>
 
           <form onSubmit={handleCaregiverSubmit} className="space-y-4">
+            {caregiverDialogMode === "approve" && (
+              <div className="space-y-2 rounded-xl border bg-muted/30 p-3 text-xs">
+                <p className="font-bold">
+                  Mandatory Caregiver Screening Checklist
+                </p>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={caregiverChecklist.backgroundScreeningVerified}
+                    onChange={(e) =>
+                      setCaregiverChecklist((prev) => ({
+                        ...prev,
+                        backgroundScreeningVerified: e.target.checked,
+                      }))
+                    }
+                  />
+                  Criminal & child-safety background clearance verified
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={caregiverChecklist.credentialsVerified}
+                    onChange={(e) =>
+                      setCaregiverChecklist((prev) => ({
+                        ...prev,
+                        credentialsVerified: e.target.checked,
+                      }))
+                    }
+                  />
+                  Pediatric first-aid / childcare credentials verified
+                </label>
+              </div>
+            )}
+
             {caregiverDialogMode === "reject" && (
               <>
                 <div className="space-y-1.5">
@@ -1366,6 +1502,7 @@ function VerificationsContent() {
                 minLength={3}
                 value={comments}
                 onChange={(e) => setComments(e.target.value)}
+                placeholder="Enter reviewer notes..."
               />
             </div>
 
@@ -1382,8 +1519,18 @@ function VerificationsContent() {
               </Button>
               <Button
                 type="submit"
-                disabled={submitting}
-                className="bg-[#087F78] text-white hover:bg-[#066B65]"
+                disabled={
+                  submitting ||
+                  (caregiverDialogMode === "approve" &&
+                    (!caregiverChecklist.backgroundScreeningVerified ||
+                      !caregiverChecklist.credentialsVerified ||
+                      comments.trim().length < 3))
+                }
+                className={
+                  caregiverDialogMode === "reject"
+                    ? "bg-rose-600 text-white hover:bg-rose-700"
+                    : "bg-[#087F78] text-white hover:bg-[#066B65]"
+                }
               >
                 {submitting ? "Submitting..." : "Confirm Decision"}
               </Button>
@@ -1392,86 +1539,318 @@ function VerificationsContent() {
         </DialogContent>
       </Dialog>
 
-      {/* Document Action Dialog */}
+      {/* Document Inspection & Review Dialog */}
       <Dialog
         open={Boolean(activeDocument && documentDialogMode)}
         onOpenChange={(open) => {
           if (!open) {
             setActiveDocument(null);
+            setInspectedDocument(null);
+            setEvidenceReviewed(false);
             setDocumentDialogMode(null);
           }
         }}
       >
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>
               {documentDialogMode === "approve"
-                ? "Approve Verification Document"
+                ? "Inspect & Verify Compliance Document"
                 : "Reject Verification Document"}
             </DialogTitle>
             <DialogDescription>
-              Document: <strong>{activeDocument?.documentTitle}</strong>
+              Document:{" "}
+              <strong>
+                {inspectedDocument?.documentTitle ||
+                  activeDocument?.documentTitle}
+              </strong>
             </DialogDescription>
           </DialogHeader>
 
-          <form onSubmit={handleDocumentSubmit} className="space-y-4">
-            {documentDialogMode === "reject" && (
-              <>
-                <div className="space-y-1.5">
-                  <Label htmlFor="doc-rejection-reason">
-                    Rejection Reason (Required)
-                  </Label>
-                  <Textarea
-                    id="doc-rejection-reason"
-                    required
-                    minLength={5}
-                    value={rejectionReason}
-                    onChange={(e) => setRejectionReason(e.target.value)}
-                  />
+          {(() => {
+            const docDetail = inspectedDocument ?? activeDocument;
+            if (!docDetail) return null;
+
+            const isQuarantined =
+              Boolean(docDetail.quarantinedAt) ||
+              docDetail.malwareScanStatus === "INFECTED";
+            const isClean = docDetail.malwareScanStatus === "CLEAN";
+            const hasSignedPreview = Boolean(docDetail.signedAccessUrl);
+            const canApproveDocument =
+              docDetail.status !== "VERIFIED" &&
+              !docDetail.isExpired &&
+              !isQuarantined &&
+              isClean &&
+              Boolean(docDetail.contentAvailable) &&
+              evidenceReviewed &&
+              comments.trim().length >= 3;
+
+            return (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 gap-2 rounded-xl border bg-muted/30 p-3 text-xs sm:grid-cols-2">
+                  <div>
+                    <span className="text-muted-foreground">Category / Type: </span>
+                    <strong>
+                      {docDetail.documentCategory || "PROVIDER"} •{" "}
+                      {docDetail.documentType}
+                    </strong>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-muted-foreground">Status:</span>
+                    <StatusPill status={docDetail.status} />
+                    <StatusPill status={docDetail.malwareScanStatus} />
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">File: </span>
+                    <strong>
+                      {docDetail.originalFileName || docDetail.mimeType}
+                    </strong>{" "}
+                    ({Math.round(docDetail.fileSizeBytes / 1024)} KB)
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Scanner: </span>
+                    <strong>
+                      {docDetail.malwareScanProvider || "Not yet scanned"}
+                    </strong>
+                    {docDetail.malwareScannedAt
+                      ? ` • ${new Date(docDetail.malwareScannedAt).toLocaleString()}`
+                      : ""}
+                  </div>
+                  {docDetail.checksumSha256 && (
+                    <div className="truncate sm:col-span-2">
+                      <span className="text-muted-foreground">SHA-256: </span>
+                      <code className="text-[11px]">
+                        {docDetail.checksumSha256}
+                      </code>
+                    </div>
+                  )}
                 </div>
-                <label className="flex items-center gap-2 text-xs font-medium">
-                  <input
-                    type="checkbox"
-                    checked={replacementRequested}
-                    onChange={(e) => setReplacementRequested(e.target.checked)}
-                    className="size-4 rounded"
-                  />
-                  Request replacement document from provider
-                </label>
-              </>
-            )}
 
-            <div className="space-y-1.5">
-              <Label htmlFor="doc-review-comments">Reviewer Comments</Label>
-              <Textarea
-                id="doc-review-comments"
-                required={documentDialogMode !== "reject"}
-                minLength={3}
-                value={comments}
-                onChange={(e) => setComments(e.target.value)}
-              />
-            </div>
+                {(isQuarantined ||
+                  !isClean ||
+                  docDetail.contentAvailable === false) && (
+                  <Alert
+                    variant={isQuarantined ? "destructive" : "default"}
+                    className="rounded-xl"
+                  >
+                    <ShieldAlert className="size-4" />
+                    <AlertTitle>
+                      {isQuarantined
+                        ? "Document Quarantined — Infected Content Detected"
+                        : !isClean
+                          ? "Trusted Malware Scan Required Before Inspection"
+                          : "Stored Document Content Unavailable"}
+                    </AlertTitle>
+                    <AlertDescription className="text-xs">
+                      {isQuarantined
+                        ? `Access and approval are permanently blocked (${docDetail.malwareScanResult || "quarantined"}). Request a clean replacement document.`
+                        : !isClean
+                          ? `Current malware scan state is ${docDetail.malwareScanStatus}.${docDetail.scannerConfigured === false ? " Configure CLAMAV_HOST to enable automated AV scanning." : " Run a malware scan before previewing or verifying this file."}`
+                          : "The document bytes are missing from verified private storage or failed integrity verification."}
+                    </AlertDescription>
+                  </Alert>
+                )}
 
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => {
-                  setActiveDocument(null);
-                  setDocumentDialogMode(null);
-                }}
-              >
-                Cancel
-              </Button>
-              <Button
-                type="submit"
-                disabled={submitting}
-                className="bg-[#087F78] text-white hover:bg-[#066B65]"
-              >
-                {submitting ? "Submitting..." : "Confirm Decision"}
-              </Button>
-            </DialogFooter>
-          </form>
+                {!isQuarantined && docDetail.status !== "VERIFIED" && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2 text-xs">
+                    <span className="text-muted-foreground">
+                      {hasSignedPreview
+                        ? "Authenticated signed preview stream ready."
+                        : "Trigger or refresh backend malware scan verification."}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      {docDetail.malwareScanStatus !== "CLEAN" && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="xs"
+                          disabled={
+                            scanningDocId === docDetail.id || docDetailLoading
+                          }
+                          onClick={() => void handleScanDocument(docDetail.id)}
+                          className="gap-1 border-amber-300 text-amber-800 dark:text-amber-300"
+                        >
+                          <ScanSearch className="size-3.5" />
+                          {scanningDocId === docDetail.id
+                            ? "Scanning..."
+                            : "Run Malware Scan"}
+                        </Button>
+                      )}
+                      {hasSignedPreview && docDetail.signedAccessUrl && (
+                        <a
+                          href={docDetail.signedAccessUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 font-semibold text-[#087F78] hover:underline"
+                        >
+                          Open Signed Preview
+                          <ExternalLink className="size-3" />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {docDetailLoading ? (
+                  <Skeleton className="h-48 w-full rounded-xl" />
+                ) : (
+                  hasSignedPreview &&
+                  docDetail.signedAccessUrl && (
+                    <div className="space-y-1.5">
+                      <p className="text-xs font-semibold text-muted-foreground">
+                        Authenticated Document Content Preview
+                      </p>
+                      <iframe
+                        sandbox=""
+                        src={docDetail.signedAccessUrl}
+                        title={docDetail.documentTitle}
+                        className="h-64 w-full rounded-xl border bg-white dark:bg-slate-950"
+                      />
+                    </div>
+                  )
+                )}
+
+                {(docDetail.reviewHistory ?? docDetail.history ?? []).length >
+                  0 && (
+                  <div className="space-y-1.5 rounded-xl border bg-muted/20 p-3 text-xs">
+                    <p className="flex items-center gap-1 font-bold">
+                      <History className="size-3.5 text-[#087F78]" />
+                      Document Review History
+                    </p>
+                    <div className="space-y-1">
+                      {(docDetail.reviewHistory ?? docDetail.history ?? [])
+                        .slice(0, 4)
+                        .map((h) => (
+                          <div
+                            key={h.id}
+                            className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground"
+                          >
+                            <span>
+                              <strong>
+                                {h.decision || h.action || h.newStatus}
+                              </strong>{" "}
+                              by {h.reviewerEmail || "admin"}
+                              {h.reviewComments
+                                ? ` — ${h.reviewComments}`
+                                : ""}
+                            </span>
+                            <span>
+                              {new Date(h.createdAt).toLocaleDateString()}
+                            </span>
+                          </div>
+                        ))}
+                    </div>
+                  </div>
+                )}
+
+                <form onSubmit={handleDocumentSubmit} className="space-y-4">
+                  {documentDialogMode === "approve" && (
+                    <label className="flex items-start gap-2 rounded-xl border bg-muted/30 p-3 text-xs font-medium">
+                      <input
+                        type="checkbox"
+                        checked={evidenceReviewed}
+                        disabled={
+                          !isClean ||
+                          isQuarantined ||
+                          !docDetail.contentAvailable ||
+                          docDetail.status === "VERIFIED"
+                        }
+                        onChange={(e) => setEvidenceReviewed(e.target.checked)}
+                        className="mt-0.5 size-4 rounded"
+                      />
+                      <span>
+                        I have inspected the document content, verified scan
+                        status CLEAN, and confirmed authenticity and expiration
+                        compliance.
+                      </span>
+                    </label>
+                  )}
+
+                  {documentDialogMode === "reject" && (
+                    <>
+                      <div className="space-y-1.5">
+                        <Label htmlFor="doc-rejection-reason">
+                          Rejection Reason (Required)
+                        </Label>
+                        <Textarea
+                          id="doc-rejection-reason"
+                          required
+                          minLength={5}
+                          value={rejectionReason}
+                          onChange={(e) => setRejectionReason(e.target.value)}
+                          placeholder="Explain why the document is rejected..."
+                        />
+                      </div>
+                      <label className="flex items-center gap-2 text-xs font-medium">
+                        <input
+                          type="checkbox"
+                          checked={replacementRequested}
+                          onChange={(e) =>
+                            setReplacementRequested(e.target.checked)
+                          }
+                          className="size-4 rounded"
+                        />
+                        Request replacement document from provider
+                      </label>
+                    </>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <Label htmlFor="doc-review-comments">
+                      Review Notes{" "}
+                      {documentDialogMode === "approve"
+                        ? "(Required)"
+                        : "(Optional)"}
+                    </Label>
+                    <Textarea
+                      id="doc-review-comments"
+                      required={documentDialogMode === "approve"}
+                      minLength={documentDialogMode === "approve" ? 3 : 0}
+                      value={comments}
+                      onChange={(e) => setComments(e.target.value)}
+                      placeholder="Record inspection findings and compliance verification notes..."
+                    />
+                  </div>
+
+                  <DialogFooter>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        setActiveDocument(null);
+                        setInspectedDocument(null);
+                        setEvidenceReviewed(false);
+                        setDocumentDialogMode(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                    {documentDialogMode === "approve" ? (
+                      <Button
+                        type="submit"
+                        disabled={
+                          submitting || docDetailLoading || !canApproveDocument
+                        }
+                        className="bg-[#087F78] text-white hover:bg-[#066B65] disabled:opacity-50"
+                      >
+                        {submitting ? "Verifying..." : "Verify Document"}
+                      </Button>
+                    ) : (
+                      <Button
+                        type="submit"
+                        disabled={
+                          submitting || rejectionReason.trim().length < 5
+                        }
+                        className="bg-rose-600 text-white hover:bg-rose-700"
+                      >
+                        {submitting ? "Submitting..." : "Confirm Rejection"}
+                      </Button>
+                    )}
+                  </DialogFooter>
+                </form>
+              </div>
+            );
+          })()}
         </DialogContent>
       </Dialog>
     </div>

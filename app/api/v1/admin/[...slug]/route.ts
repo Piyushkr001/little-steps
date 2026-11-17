@@ -1,6 +1,9 @@
 import { type NextRequest, NextResponse } from "next/server";
 import { dispatchAdminApiRequest } from "@/server/dispatcher";
-import { extractTrustedClientIp } from "@/server/middleware/rate-limit";
+import {
+  applyCookiesToNextResponse,
+  extractUnifiedRequestFromNext,
+} from "@/server/next-adapter";
 
 async function handleRequest(
   request: NextRequest,
@@ -17,50 +20,13 @@ async function handleRequest(
     }
   }
 
-  const query: Record<string, string | undefined> = {};
-  request.nextUrl.searchParams.forEach((value, key) => {
-    query[key] = value;
-  });
+  const unifiedReq = extractUnifiedRequestFromNext(request, slug, body);
+  const result = await dispatchAdminApiRequest(unifiedReq);
 
-  const cookies: Record<string, string | undefined> = {};
-  for (const cookie of request.cookies.getAll()) {
-    cookies[cookie.name] = cookie.value;
-  }
-
-  const headers: Record<string, string | undefined> = {};
-  request.headers.forEach((value, key) => {
-    headers[key.toLowerCase()] = value;
-  });
-
-  const ipAddress = extractTrustedClientIp(headers, "127.0.0.1");
-  const userAgent = request.headers.get("user-agent") || "NextClient";
-
-  const result = await dispatchAdminApiRequest({
-    method: request.method,
-    segments: slug,
-    query,
-    body,
-    cookies,
-    headers,
-    ipAddress,
-    userAgent,
-  });
-
-  const response = NextResponse.json(result.body, { status: result.status });
-
-  if (result.cookiesToSet) {
-    for (const c of result.cookiesToSet) {
-      response.cookies.set(c.name, c.value, {
-        httpOnly: c.httpOnly,
-        secure: c.secure,
-        sameSite: c.sameSite,
-        path: c.path,
-        maxAge: c.maxAge,
-      });
-    }
-  }
-
-  return response;
+  return applyCookiesToNextResponse(
+    NextResponse.json(result.body, { status: result.status }),
+    result.cookiesToSet
+  );
 }
 
 export async function GET(

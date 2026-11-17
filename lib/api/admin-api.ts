@@ -8,9 +8,11 @@ import type {
   DashboardActivity,
   DashboardAnalytics,
   DashboardStats,
+  DocumentScopeCategory,
   DocumentVerificationStatus,
   IncidentSeverity,
   IncidentStatus,
+  MalwareScanStatus,
   UserRole,
   VerificationStatus,
   VerificationSubjectType,
@@ -239,13 +241,14 @@ export const providers = {
 // ==========================================
 export interface AdminVerificationReviewHistoryItem {
   id: string;
-  subjectType: VerificationSubjectType;
-  subjectId: string;
-  action: string;
+  subjectType?: VerificationSubjectType;
+  subjectId?: string;
+  action?: string;
+  decision?: string;
   previousStatus: string | null;
   newStatus: string;
-  reviewerId: string | null;
-  reviewerName: string | null;
+  reviewerId?: string | null;
+  reviewerName?: string | null;
   reviewerEmail: string | null;
   reviewComments: string | null;
   rejectionReason: string | null;
@@ -260,23 +263,35 @@ export interface AdminVerificationDocumentItem {
   centerName?: string | null;
   caregiverId: string | null;
   caregiverName?: string | null;
-  verificationId: string | null;
+  verificationId?: string | null;
+  documentCategory?: DocumentScopeCategory | string;
   documentType: string;
   documentTitle: string;
+  originalFileName?: string | null;
   mimeType: string;
   fileSizeBytes: number;
   checksumSha256: string | null;
-  malwareScanStatus: string;
+  malwareScanStatus: MalwareScanStatus | string;
+  malwareScanProvider?: string | null;
+  malwareScannedAt?: string | null;
+  malwareScanResult?: string | null;
+  quarantinedAt?: string | null;
+  scannerConfigured?: boolean;
+  contentAvailable?: boolean;
+  signedAccessUrl?: string | null;
   status: DocumentVerificationStatus | string;
   isExpired: boolean;
   expiresAt: string | null;
-  reviewedBy: string | null;
-  reviewerName: string | null;
+  reviewedBy?: string | null;
+  reviewedByEmail?: string | null;
+  reviewerName?: string | null;
   reviewedAt: string | null;
   reviewNotes: string | null;
   rejectionReason: string | null;
   replacementRequested: boolean;
+  accessUrl?: string;
   accessDescriptor?: string;
+  history?: AdminVerificationReviewHistoryItem[];
   reviewHistory?: AdminVerificationReviewHistoryItem[];
   createdAt?: string;
 }
@@ -420,7 +435,11 @@ export const verifications = {
     id: string,
     payload: {
       reviewComments: string;
-      checklistState?: Record<string, boolean>;
+      checklistState: {
+        licenseVerified: boolean;
+        organizationDetailsVerified: boolean;
+      };
+      expiresAt?: string;
     }
   ) {
     const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
@@ -485,8 +504,12 @@ export const centerVerifications = {
         facilitySafetyVerified: boolean;
         caregiverQualificationVerified: boolean;
         capacityVerified: boolean;
+        operatingHoursVerified: boolean;
+        ageGroupsVerified: boolean;
       };
-      verificationExpiresAt?: string;
+      safetyComplianceNotes?: string;
+      activateListing?: boolean;
+      expiresAt?: string;
     }
   ) {
     const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
@@ -547,8 +570,11 @@ export const caregiverVerifications = {
     caregiverId: string,
     payload: {
       reviewComments: string;
-      verificationExpiresAt?: string;
-      checklistState?: Record<string, boolean>;
+      checklistState: {
+        backgroundScreeningVerified: boolean;
+        credentialsVerified: boolean;
+      };
+      expiresAt?: string;
     }
   ) {
     const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
@@ -595,16 +621,58 @@ export const verificationDocuments = {
     return data.data;
   },
 
+  async upload(
+    payload:
+      | FormData
+      | {
+          providerId: string;
+          centerId?: string | null;
+          caregiverId?: string | null;
+          documentCategory: DocumentScopeCategory;
+          documentType: string;
+          documentTitle: string;
+          fileName: string;
+          mimeType?: "application/pdf" | "image/png" | "image/jpeg";
+          fileBase64: string;
+          expiresAt?: string | null;
+        }
+  ) {
+    const { data } = await adminAxiosClient.post<
+      ApiSuccessResponse<{
+        documentId: string;
+        malwareScanStatus: MalwareScanStatus | string;
+        status: string;
+        scannerConfigured: boolean;
+      }>
+    >("/admin/verification-documents/upload", payload);
+    return data.data;
+  },
+
+  async scan(documentId: string) {
+    const { data } = await adminAxiosClient.post<
+      ApiSuccessResponse<{
+        documentId: string;
+        malwareScanStatus: MalwareScanStatus | string;
+        malwareScanProvider: string | null;
+        malwareScannedAt: string | null;
+        malwareScanResult: string | null;
+        configured: boolean;
+      }>
+    >(`/admin/verification-documents/${documentId}/scan`, {});
+    return data.data;
+  },
+
   async approve(
     documentId: string,
-    payload?: {
-      reviewComments?: string;
+    payload: {
+      reviewNotes: string;
+      evidenceReviewed: true;
       expiresAt?: string;
     }
   ) {
     const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(
       `/admin/verification-documents/${documentId}/approve`,
-      payload ?? {}
+      payload
     );
     return data.data;
   },
@@ -613,8 +681,8 @@ export const verificationDocuments = {
     documentId: string,
     payload: {
       rejectionReason: string;
-      reviewComments?: string;
-      replacementRequested?: boolean;
+      reviewNotes?: string;
+      requestReplacement?: boolean;
     }
   ) {
     const { data } = await adminAxiosClient.post<ApiSuccessResponse<unknown>>(

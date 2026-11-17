@@ -219,7 +219,12 @@ export async function getAdminDashboardActivity(): Promise<
       )
       .orderBy(desc(providerVerifications.submittedAt))
       .limit(6),
-    db.select().from(verificationDocuments),
+    db
+      .select({
+        id: verificationDocuments.id,
+        providerId: verificationDocuments.providerId,
+      })
+      .from(verificationDocuments),
     db.select().from(bookings).orderBy(desc(bookings.createdAt)).limit(6),
     db
       .select()
