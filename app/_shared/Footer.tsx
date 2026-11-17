@@ -27,7 +27,6 @@ const QUICK_LINKS = [
   { title: "About Us", href: "/about" },
   { title: "Our Services", href: "/services" },
   { title: "Find Care", href: "/centers" },
-  { title: "Contact Us", href: "/contact" },
 ];
 
 const PARENT_LINKS = [
