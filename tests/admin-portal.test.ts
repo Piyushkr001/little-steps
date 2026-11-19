@@ -32,12 +32,17 @@ import {
   verificationDocuments,
   verificationReviewHistory,
 } from "../config/schema";
+import { validateRuntimeConfiguration } from "../server/config/runtime-config";
 import {
   type CookieInstruction,
   dispatchAdminApiRequest,
   handleDocumentContentStreamRequest,
 } from "../server/dispatcher";
-import { setAdminOtpMailInterceptorForTests } from "../server/mail/nodemailer";
+import {
+  resolveSmtpTransportConfig,
+  setAdminOtpMailInterceptorForTests,
+} from "../server/mail/nodemailer";
+import { readBoundedRequestBytes } from "../server/next-adapter";
 import {
   checkRateLimit,
   getActiveKeyLockCountForTests,
@@ -95,6 +100,138 @@ function buildColumnMap(table: object): Map<string, string> {
 
 const pgDialect = new PgDialect();
 
+function stripBalancedOuterParens(input: string): string {
+  let s = input.trim();
+  while (s.startsWith("(") && s.endsWith(")")) {
+    let depth = 0;
+    let wrapsWhole = true;
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === "(") depth++;
+      else if (s[i] === ")") depth--;
+      if (depth === 0 && i < s.length - 1) {
+        wrapsWhole = false;
+        break;
+      }
+    }
+    if (!wrapsWhole) break;
+    s = s.slice(1, -1).trim();
+  }
+  return s;
+}
+
+function splitTopLevelKeyword(input: string, keyword: "and" | "or"): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let lastIdx = 0;
+  const lower = input.toLowerCase();
+  const token = ` ${keyword} `;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+    } else if (depth === 0 && lower.startsWith(token, i)) {
+      parts.push(input.slice(lastIdx, i).trim());
+      i += token.length - 1;
+      lastIdx = i + 1;
+    }
+  }
+  parts.push(input.slice(lastIdx).trim());
+  return parts;
+}
+
+function toComparableNumber(value: unknown): number {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
+    return Date.parse(value);
+  }
+  return Number(value);
+}
+
+function evaluateSqlClause(
+  rawClause: string,
+  row: RowRecord,
+  colMap: Map<string, string>,
+  params: unknown[]
+): boolean {
+  const expr = stripBalancedOuterParens(rawClause);
+  if (!expr) return true;
+
+  const orParts = splitTopLevelKeyword(expr, "or");
+  if (orParts.length > 1) {
+    return orParts.some((p) => evaluateSqlClause(p, row, colMap, params));
+  }
+
+  const andParts = splitTopLevelKeyword(expr, "and");
+  if (andParts.length > 1) {
+    return andParts.every((p) => evaluateSqlClause(p, row, colMap, params));
+  }
+
+  const isNullMatch = expr.match(/^"[^"]+"\."([^"]+)"\s+is\s+null$/i);
+  if (isNullMatch) {
+    const jsKey = colMap.get(isNullMatch[1]) ?? isNullMatch[1];
+    return row[jsKey] === null || row[jsKey] === undefined;
+  }
+
+  const isNotNullMatch = expr.match(/^"[^"]+"\."([^"]+)"\s+is\s+not\s+null$/i);
+  if (isNotNullMatch) {
+    const jsKey = colMap.get(isNotNullMatch[1]) ?? isNotNullMatch[1];
+    return row[jsKey] !== null && row[jsKey] !== undefined;
+  }
+
+  const eqMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*=\s*\$(\d+)$/i);
+  if (eqMatch) {
+    const jsKey = colMap.get(eqMatch[1]) ?? eqMatch[1];
+    const expected = params[Number(eqMatch[2]) - 1];
+    return row[jsKey] === expected;
+  }
+
+  const neMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*(?:<>|!=)\s*\$(\d+)$/i);
+  if (neMatch) {
+    const jsKey = colMap.get(neMatch[1]) ?? neMatch[1];
+    const disallowed = params[Number(neMatch[2]) - 1];
+    return row[jsKey] !== disallowed;
+  }
+
+  const gteMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*>=\s*\$(\d+)$/i);
+  if (gteMatch) {
+    const jsKey = colMap.get(gteMatch[1]) ?? gteMatch[1];
+    return toComparableNumber(row[jsKey]) >= toComparableNumber(params[Number(gteMatch[2]) - 1]);
+  }
+
+  const lteMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*<=\s*\$(\d+)$/i);
+  if (lteMatch) {
+    const jsKey = colMap.get(lteMatch[1]) ?? lteMatch[1];
+    return toComparableNumber(row[jsKey]) <= toComparableNumber(params[Number(lteMatch[2]) - 1]);
+  }
+
+  const gtMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*>\s*\$(\d+)$/i);
+  if (gtMatch) {
+    const jsKey = colMap.get(gtMatch[1]) ?? gtMatch[1];
+    return toComparableNumber(row[jsKey]) > toComparableNumber(params[Number(gtMatch[2]) - 1]);
+  }
+
+  const ltMatch = expr.match(/^"[^"]+"\."([^"]+)"\s*<\s*\$(\d+)$/i);
+  if (ltMatch) {
+    const jsKey = colMap.get(ltMatch[1]) ?? ltMatch[1];
+    return toComparableNumber(row[jsKey]) < toComparableNumber(params[Number(ltMatch[2]) - 1]);
+  }
+
+  const inMatch = expr.match(/^"[^"]+"\."([^"]+)"\s+in\s+\(([^)]+)\)$/i);
+  if (inMatch) {
+    const jsKey = colMap.get(inMatch[1]) ?? inMatch[1];
+    const indices = inMatch[2]
+      .split(",")
+      .map((s) => Number(s.trim().replace("$", "")) - 1);
+    const allowed = indices.map((idx) => params[idx]);
+    return allowed.includes(row[jsKey]);
+  }
+
+  return true;
+}
+
 function evaluateWhereCondition(
   row: RowRecord,
   table: object,
@@ -105,92 +242,7 @@ function evaluateWhereCondition(
   const { sql: rawSql, params } = pgDialect.sqlToQuery(
     whereExpr as Parameters<typeof pgDialect.sqlToQuery>[0]
   );
-
-  const clauses = rawSql.trim().split(/\s+and\s+/i);
-  for (let clause of clauses) {
-    clause = clause.trim();
-    while (clause.startsWith("(")) {
-      clause = clause.slice(1).trim();
-    }
-    if (/\s+in\s+\(/i.test(clause)) {
-      const inCloseIdx = clause.indexOf(")");
-      if (inCloseIdx !== -1) {
-        clause = clause.slice(0, inCloseIdx + 1).trim();
-      }
-    } else {
-      while (clause.endsWith(")")) {
-        clause = clause.slice(0, -1).trim();
-      }
-    }
-
-    const isNullMatch = clause.match(/^"[^"]+"\."([^"]+)"\s+is\s+null$/i);
-    if (isNullMatch) {
-      const jsKey = colMap.get(isNullMatch[1]) ?? isNullMatch[1];
-      if (row[jsKey] !== null && row[jsKey] !== undefined) return false;
-      continue;
-    }
-
-    const eqMatch = clause.match(/^"[^"]+"\."([^"]+)"\s*=\s*\$(\d+)$/i);
-    if (eqMatch) {
-      const jsKey = colMap.get(eqMatch[1]) ?? eqMatch[1];
-      const expected = params[Number(eqMatch[2]) - 1];
-      if (row[jsKey] !== expected) return false;
-      continue;
-    }
-
-    const neMatch = clause.match(/^"[^"]+"\."([^"]+)"\s*(?:<>|!=)\s*\$(\d+)$/i);
-    if (neMatch) {
-      const jsKey = colMap.get(neMatch[1]) ?? neMatch[1];
-      const disallowed = params[Number(neMatch[2]) - 1];
-      if (row[jsKey] === disallowed) return false;
-      continue;
-    }
-
-    const gtMatch = clause.match(/^"[^"]+"\."([^"]+)"\s*>\s*\$(\d+)$/i);
-    if (gtMatch) {
-      const jsKey = colMap.get(gtMatch[1]) ?? gtMatch[1];
-      const left = row[jsKey];
-      const right = params[Number(gtMatch[2]) - 1];
-      const leftVal = left instanceof Date ? left.getTime() : Number(left);
-      const rightVal =
-        right instanceof Date
-          ? right.getTime()
-          : typeof right === "string" && !Number.isNaN(Date.parse(right))
-            ? Date.parse(right)
-            : Number(right);
-      if (!(leftVal > rightVal)) return false;
-      continue;
-    }
-
-    const ltMatch = clause.match(/^"[^"]+"\."([^"]+)"\s*<\s*\$(\d+)$/i);
-    if (ltMatch) {
-      const jsKey = colMap.get(ltMatch[1]) ?? ltMatch[1];
-      const left = row[jsKey];
-      const right = params[Number(ltMatch[2]) - 1];
-      const leftVal = left instanceof Date ? left.getTime() : Number(left);
-      const rightVal =
-        right instanceof Date
-          ? right.getTime()
-          : typeof right === "string" && !Number.isNaN(Date.parse(right))
-            ? Date.parse(right)
-            : Number(right);
-      if (!(leftVal < rightVal)) return false;
-      continue;
-    }
-
-    const inMatch = clause.match(/^"[^"]+"\."([^"]+)"\s+in\s+\(([^)]+)\)$/i);
-    if (inMatch) {
-      const jsKey = colMap.get(inMatch[1]) ?? inMatch[1];
-      const indices = inMatch[2]
-        .split(",")
-        .map((s) => Number(s.trim().replace("$", "")) - 1);
-      const allowed = indices.map((idx) => params[idx]);
-      if (!allowed.includes(row[jsKey])) return false;
-      continue;
-    }
-  }
-
-  return true;
+  return evaluateSqlClause(rawSql, row, colMap, params);
 }
 
 function createIsolatedMemoryDatabase() {
@@ -569,6 +621,10 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
         "users:manage",
         "providers:read",
         "providers:verify",
+        "documents:read",
+        "documents:review",
+        "documents:upload",
+        "documents:scan",
         "centers:manage",
         "bookings:read",
         "bookings:manage",
@@ -590,6 +646,10 @@ async function seedIsolatedTestFixtures(db: AppDatabase) {
         "users:manage",
         "providers:read",
         "providers:verify",
+        "documents:read",
+        "documents:review",
+        "documents:upload",
+        "documents:scan",
         "centers:manage",
         "bookings:read",
         "bookings:manage",
@@ -1814,6 +1874,38 @@ async function runPhase1SecurityTestSuite() {
       .where(undefined);
     assert.ok(p2VerifAfterReq);
 
+    // Blind approval without inspecting document content must fail (400 DOCUMENT_CONTENT_NOT_ACCESSED)
+    const failBlindOrgDocApprove = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", p2OrgDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting blind approval before content access.",
+        evidenceReviewed: true,
+      },
+      cookies: p2Cookies,
+      headers: p2Headers,
+      ipAddress: "10.30.0.1",
+      userAgent: "Phase2VerificationTest/1.0",
+    });
+    assert.equal(failBlindOrgDocApprove.status, 400);
+
+    // Inspect document content via authenticated stream (records VERIFICATION_DOCUMENT_ACCESSED)
+    const orgDocStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", p2OrgDoc.id, "content"],
+        query: {},
+        body: undefined,
+        cookies: p2Cookies,
+        headers: {},
+        ipAddress: "10.30.0.1",
+        userAgent: "Phase2VerificationTest/1.0",
+      },
+      p2OrgDoc.id
+    );
+    assert.equal(orgDocStream.ok, true);
+
     // Individually approve the organization document via POST /verification-documents/:id/approve
     const approveOrgDocRes = await dispatchAdminApiRequest({
       method: "POST",
@@ -1822,6 +1914,7 @@ async function runPhase1SecurityTestSuite() {
       body: {
         reviewNotes: "Verified state license number against state registry.",
         evidenceReviewed: true,
+        reviewedChecksumSha256: samplePdfSha256,
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -1991,6 +2084,22 @@ async function runPhase1SecurityTestSuite() {
     });
     assert.equal(failCenterBeforeCgAndDoc.status, 400);
 
+    // Inspect p2CenterADoc via authenticated stream before approving
+    const centerDocStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", p2CenterADoc.id, "content"],
+        query: {},
+        body: undefined,
+        cookies: p2Cookies,
+        headers: {},
+        ipAddress: "10.30.0.1",
+        userAgent: "Phase2VerificationTest/1.0",
+      },
+      p2CenterADoc.id
+    );
+    assert.equal(centerDocStream.ok, true);
+
     // Approve p2CenterADoc first
     const approveCenterDocRes = await dispatchAdminApiRequest({
       method: "POST",
@@ -1999,6 +2108,7 @@ async function runPhase1SecurityTestSuite() {
       body: {
         reviewNotes: "Verified municipal fire permit for North Campus.",
         evidenceReviewed: true,
+        reviewedChecksumSha256: samplePdfSha256,
       },
       cookies: p2Cookies,
       headers: p2Headers,
@@ -3187,11 +3297,433 @@ async function runPhase1SecurityTestSuite() {
       "    [PASS] Rate limiter lock cleanup, atomic Redis EVAL, prod fail-closed, and SQL upsert verified."
     );
 
+    // ========================================================================
+    // PART H: Final Phase 2.1 Granular Document Permissions, Evidence Review,
+    // Expired Persistence, Upload Bounds, SMTP & Runtime Config Tests
+    // ========================================================================
+    console.log(
+      "H1. Testing Granular Document Permissions (providers:read MUST NOT Grant Document Access)..."
+    );
+
+    const [provReadOnlyUser] = await memoryDb
+      .insert(users)
+      .values({
+        email: "providers.readonly.admin@littlesteps.com",
+        name: "Provider Metadata Viewer",
+        role: "ADMIN",
+        status: "ACTIVE",
+        emailVerified: true,
+      })
+      .returning();
+    await memoryDb.insert(userRoles).values({
+      userId: provReadOnlyUser.id,
+      role: "ADMIN",
+      isActive: true,
+    });
+    await memoryDb.insert(adminProfiles).values({
+      userId: provReadOnlyUser.id,
+      department: "Partner Support",
+      title: "Provider Directory Viewer",
+      isApproved: true,
+      permissions: ["dashboard:read", "providers:read"],
+    });
+
+    resetAllRateLimitsForTests();
+    const provOnlyOtpReq = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "request-otp"],
+      query: {},
+      body: { email: provReadOnlyUser.email },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(provOnlyOtpReq.status, 200);
+    const provOnlyVerify = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["auth", "verify-otp"],
+      query: {},
+      body: {
+        email: provReadOnlyUser.email,
+        otp: interceptedEmails.at(-1)!.otpCode,
+      },
+      cookies: {},
+      headers: {},
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(provOnlyVerify.status, 200);
+    const provOnlyCookies = Object.fromEntries(
+      (provOnlyVerify.cookiesToSet ?? []).map((c: CookieInstruction) => [
+        c.name,
+        c.value,
+      ])
+    );
+    const provOnlyHeaders = {
+      [ADMIN_CSRF_HEADER_NAME]: provOnlyCookies[ADMIN_CSRF_COOKIE_NAME],
+      host: "localhost:3000",
+      origin: "http://localhost:3000",
+    };
+
+    // Allowed: providers list (`providers:read`)
+    const provOnlyCanListProviders = await dispatchAdminApiRequest({
+      method: "GET",
+      segments: ["providers"],
+      query: {},
+      body: undefined,
+      cookies: provOnlyCookies,
+      headers: {},
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(provOnlyCanListProviders.status, 200);
+
+    // Denied (403): ALL verification-documents endpoints require dedicated documents:* permissions
+    const deniedDocList = await dispatchAdminApiRequest({
+      method: "GET",
+      segments: ["verification-documents"],
+      query: {},
+      body: undefined,
+      cookies: provOnlyCookies,
+      headers: {},
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(deniedDocList.status, 403);
+
+    const deniedDocContent = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", p2OrgDoc.id, "content"],
+        query: {},
+        body: undefined,
+        cookies: provOnlyCookies,
+        headers: {},
+        ipAddress: "10.40.0.1",
+        userAgent: "FinalPhase21Test/1.0",
+      },
+      p2OrgDoc.id
+    );
+    assert.equal(deniedDocContent.ok, false);
+    if (!deniedDocContent.ok) {
+      assert.equal(deniedDocContent.response.status, 403);
+    }
+
+    const deniedDocUpload = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", "upload"],
+      query: {},
+      body: {},
+      cookies: provOnlyCookies,
+      headers: provOnlyHeaders,
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(deniedDocUpload.status, 403);
+
+    const deniedDocScan = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", p2OrgDoc.id, "scan"],
+      query: {},
+      body: {},
+      cookies: provOnlyCookies,
+      headers: provOnlyHeaders,
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(deniedDocScan.status, 403);
+
+    const deniedDocApprove = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", p2OrgDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Unauthorized review attempt",
+        evidenceReviewed: true,
+      },
+      cookies: provOnlyCookies,
+      headers: provOnlyHeaders,
+      ipAddress: "10.40.0.1",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(deniedDocApprove.status, 403);
+
+    console.log(
+      "    [PASS] Granular documents:* permissions strictly isolated from providers:read."
+    );
+
+    console.log(
+      "H2. Testing Checksum Version Binding & Expired Document Persisted Transition (TASK 6 & 7)..."
+    );
+
+    // Restore test PDF bytes in memory store
+    inMemoryDocumentObjects.set("final-p21/version-doc.pdf", samplePdfBytes);
+    inMemoryDocumentObjects.set("final-p21/expired-doc.pdf", samplePdfBytes);
+
+    const [versionDoc] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        documentCategory: "PROVIDER",
+        documentType: "TAX_CLEARANCE",
+        documentTitle: "Version-Bound Tax Clearance",
+        storageReference: "private://final-p21/version-doc.pdf",
+        originalFileName: "version-doc.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: samplePdfSha256,
+        malwareScanStatus: "CLEAN",
+        malwareScanProvider: "CLAMAV",
+        malwareScannedAt: new Date(),
+        status: "SUBMITTED",
+        expiresAt: new Date(Date.now() + 90 * 86_400_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+
+    // Access content stream first
+    const verStream = await handleDocumentContentStreamRequest(
+      {
+        method: "GET",
+        segments: ["verification-documents", versionDoc.id, "content"],
+        query: {},
+        body: undefined,
+        cookies: reviewerCookies,
+        headers: {},
+        ipAddress: "10.40.0.2",
+        userAgent: "FinalPhase21Test/1.0",
+      },
+      versionDoc.id
+    );
+    assert.equal(verStream.ok, true);
+
+    // Mismatched reviewedChecksumSha256 MUST fail with 409 DOCUMENT_VERSION_MISMATCH
+    const failWrongChecksum = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", versionDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting approval with stale checksum",
+        evidenceReviewed: true,
+        reviewedChecksumSha256: "0".repeat(64),
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.40.0.2",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(failWrongChecksum.status, 409);
+
+    // Matching reviewedChecksumSha256 succeeds (200)
+    const okChecksumApprove = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", versionDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Verified exact file version checksum after previewing.",
+        evidenceReviewed: true,
+        reviewedChecksumSha256: samplePdfSha256,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.40.0.2",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(okChecksumApprove.status, 200);
+
+    // TASK 7 Regression: Approving an expired document returns 400 AND persists EXPIRED status
+    const [expiredDoc] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        documentCategory: "PROVIDER",
+        documentType: "EXPIRED_PERMIT",
+        documentTitle: "Expired Permit Regression Fixture",
+        storageReference: "private://final-p21/expired-doc.pdf",
+        originalFileName: "expired-doc.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: samplePdfSha256,
+        malwareScanStatus: "CLEAN",
+        malwareScanProvider: "CLAMAV",
+        malwareScannedAt: new Date(),
+        status: "SUBMITTED",
+        expiresAt: new Date(Date.now() - 86_400_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+
+    const failExpiredApprove = await dispatchAdminApiRequest({
+      method: "POST",
+      segments: ["verification-documents", expiredDoc.id, "approve"],
+      query: {},
+      body: {
+        reviewNotes: "Attempting to verify expired document",
+        evidenceReviewed: true,
+      },
+      cookies: reviewerCookies,
+      headers: reviewerHeaders,
+      ipAddress: "10.40.0.2",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(failExpiredApprove.status, 400);
+
+    const allDocsAfterExpiry = await memoryDb.select().from(verificationDocuments);
+    const persistedExpired = allDocsAfterExpiry.find(
+      (d) => d.id === expiredDoc.id
+    )!;
+    assert.equal(
+      persistedExpired.status,
+      "EXPIRED",
+      "Expired document status must persist in DB rather than rolling back with the failed approval"
+    );
+    assert.equal(
+      persistedExpired.reviewedBy ?? null,
+      null,
+      "Failed expired approval must never leave partial reviewer approval metadata"
+    );
+
+    const expiredAuditLogs = (
+      await memoryDb.select().from(adminAuditLogs)
+    ).filter(
+      (l) =>
+        l.entityId === expiredDoc.id &&
+        l.action === "VERIFICATION_DOCUMENT_EXPIRED"
+    );
+    assert.equal(expiredAuditLogs.length, 1);
+
+    console.log(
+      "    [PASS] Evidence checksum version binding and committed EXPIRED document persistence verified."
+    );
+
+    console.log(
+      "H3. Testing Historical Scan Report, HTTP 413 Upload Bounds, SMTP Pass & Runtime Config..."
+    );
+
+    // Seed legacy unscanned CLEAN row + missing checksum row + expired VERIFIED row
+    const [legacyUnscannedClean] = await memoryDb
+      .insert(verificationDocuments)
+      .values({
+        providerId: p2Provider.id,
+        documentCategory: "PROVIDER",
+        documentType: "LEGACY_CERT",
+        documentTitle: "Legacy Unprovenanced Clean Doc",
+        storageReference: "private://final-p21/expired-doc.pdf",
+        mimeType: "application/pdf",
+        fileSizeBytes: samplePdfBytes.byteLength,
+        checksumSha256: null,
+        malwareScanStatus: "CLEAN",
+        malwareScanProvider: null,
+        malwareScannedAt: null,
+        status: "VERIFIED",
+        expiresAt: new Date(Date.now() - 3600_000),
+        uploadedBy: p2Owner.id,
+      })
+      .returning();
+
+    const histReportRes = await dispatchAdminApiRequest({
+      method: "GET",
+      segments: ["verification-documents", "diagnostics", "historical-report"],
+      query: {},
+      body: undefined,
+      cookies: reviewerCookies,
+      headers: {},
+      ipAddress: "10.40.0.2",
+      userAgent: "FinalPhase21Test/1.0",
+    });
+    assert.equal(histReportRes.status, 200);
+    const histData = histReportRes.body.data as {
+      readOnly: boolean;
+      cleanWithoutProviderIds: string[];
+      cleanWithoutTimestampIds: string[];
+      missingChecksumIds: string[];
+      expiredVerifiedDocumentIds: string[];
+      documentsRequiringReviewIds: string[];
+    };
+    assert.equal(histData.readOnly, true);
+    assert.ok(histData.cleanWithoutProviderIds.includes(legacyUnscannedClean.id));
+    assert.ok(histData.cleanWithoutTimestampIds.includes(legacyUnscannedClean.id));
+    assert.ok(histData.missingChecksumIds.includes(legacyUnscannedClean.id));
+    assert.ok(histData.expiredVerifiedDocumentIds.includes(legacyUnscannedClean.id));
+    assert.ok(histData.documentsRequiringReviewIds.includes(legacyUnscannedClean.id));
+
+    // HTTP 413 Payload Too Large enforcement (header pre-check AND streaming check without Content-Length)
+    let threwHeader413 = false;
+    try {
+      const fakeHeaderReq = new Request("http://localhost:3000/upload", {
+        method: "POST",
+        headers: { "content-length": String(25 * 1024 * 1024) },
+      });
+      await readBoundedRequestBytes(fakeHeaderReq, 1024);
+    } catch (err) {
+      threwHeader413 =
+        (err as { statusCode?: number }).statusCode === 413;
+    }
+    assert.equal(threwHeader413, true);
+
+    let threwStream413 = false;
+    try {
+      const oversizedStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(600));
+          controller.enqueue(new Uint8Array(600));
+          controller.close();
+        },
+      });
+      const fakeChunkedReq = new Request("http://localhost:3000/upload", {
+        method: "POST",
+        body: oversizedStream,
+        duplex: "half",
+      } as RequestInit);
+      await readBoundedRequestBytes(fakeChunkedReq, 1024);
+    } catch (err) {
+      threwStream413 =
+        (err as { statusCode?: number }).statusCode === 413;
+    }
+    assert.equal(threwStream413, true);
+
+    // TASK 11: SMTP password whitespace preserved verbatim
+    const resolvedSmtp = resolveSmtpTransportConfig({
+      SMTP_HOST: "smtp.example.com",
+      SMTP_PORT: "587",
+      SMTP_USER: "security@example.com",
+      SMTP_PASS: " pass word with spaces ",
+      SMTP_SECURE: "false",
+    } as unknown as NodeJS.ProcessEnv);
+    assert.equal(
+      resolvedSmtp.pass,
+      " pass word with spaces ",
+      "SMTP_PASS must be passed verbatim without stripping whitespace"
+    );
+
+    // TASK 12: Production config validation fails safely when S3 or ClamAV are missing and leaks zero secrets
+    const prodReport = validateRuntimeConfiguration({
+      NODE_ENV: "production",
+      DATABASE_URL: "postgresql://user:supersecret@ep.neon.tech/prod",
+      ADMIN_OTP_HMAC_SECRET: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90",
+      ADMIN_SESSION_SECRET: "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f",
+      DOCUMENT_STORAGE_DRIVER: "local",
+      NEXT_PUBLIC_APP_URL: "https://littlesteps.example.com",
+    } as unknown as NodeJS.ProcessEnv);
+    assert.equal(prodReport.productionReady, false);
+    assert.equal(prodReport.documentUploadsEnabled, false);
+    assert.equal(prodReport.documentStorageDriver, "unconfigured");
+    assert.equal(JSON.stringify(prodReport).includes("supersecret"), false);
+    assert.equal(
+      JSON.stringify(prodReport).includes("a1b2c3d4e5f60718"),
+      false
+    );
+
+    console.log(
+      "    [PASS] Historical report, HTTP 413 upload bounds, SMTP verbatim password, and runtime config checks verified."
+    );
+
     console.log(
       "=================================================================="
     );
     console.log(
-      "ALL PHASE 1, PHASE 2 & PHASE 2.1 TESTS PASSED (100% ISOLATED)!"
+      "ALL PHASE 1, PHASE 2 & FINAL PHASE 2.1 TESTS PASSED (100% ISOLATED)!"
     );
     console.log(
       "=================================================================="

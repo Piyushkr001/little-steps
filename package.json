@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:admin": "jiti tests/admin-portal.test.ts",
+    "test:documents": "jiti tests/document-storage-scanner.test.ts",
     "test:pg": "jiti tests/postgres-transaction.test.ts"
   },
   "dependencies": {

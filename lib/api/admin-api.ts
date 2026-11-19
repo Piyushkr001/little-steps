@@ -278,6 +278,9 @@ export interface AdminVerificationDocumentItem {
   quarantinedAt?: string | null;
   scannerConfigured?: boolean;
   contentAvailable?: boolean;
+  checksumVerified?: boolean;
+  storageScheme?: "s3" | "local" | "unmanaged";
+  recentlyAccessedByCurrentAdmin?: boolean;
   signedAccessUrl?: string | null;
   status: DocumentVerificationStatus | string;
   isExpired: boolean;
@@ -600,7 +603,23 @@ export const caregiverVerifications = {
   },
 };
 
+export interface AdminDocumentDiagnosticsStatus {
+  storageDriver: "s3" | "local" | "unconfigured";
+  uploadsEnabled: boolean;
+  storageMessage: string;
+  scannerConfigured: boolean;
+  maxUploadSizeBytes: number;
+  productionReady: boolean;
+}
+
 export const verificationDocuments = {
+  async getStatus() {
+    const { data } = await adminAxiosClient.get<
+      ApiSuccessResponse<AdminDocumentDiagnosticsStatus>
+    >("/admin/verification-documents/diagnostics/status");
+    return data.data;
+  },
+
   async list(params?: {
     status?: string;
     providerId?: string;
@@ -635,7 +654,10 @@ export const verificationDocuments = {
           mimeType?: "application/pdf" | "image/png" | "image/jpeg";
           fileBase64: string;
           expiresAt?: string | null;
-        }
+        },
+    options?: {
+      onUploadProgress?: (percent: number) => void;
+    }
   ) {
     const { data } = await adminAxiosClient.post<
       ApiSuccessResponse<{
@@ -643,8 +665,19 @@ export const verificationDocuments = {
         malwareScanStatus: MalwareScanStatus | string;
         status: string;
         scannerConfigured: boolean;
+        storageDriver?: string;
       }>
-    >("/admin/verification-documents/upload", payload);
+    >("/admin/verification-documents/upload", payload, {
+      onUploadProgress: options?.onUploadProgress
+        ? (evt) => {
+            const total = evt.total || 0;
+            if (total > 0) {
+              const pct = Math.min(100, Math.round((evt.loaded / total) * 100));
+              options.onUploadProgress?.(pct);
+            }
+          }
+        : undefined,
+    });
     return data.data;
   },
 
@@ -667,6 +700,7 @@ export const verificationDocuments = {
     payload: {
       reviewNotes: string;
       evidenceReviewed: true;
+      reviewedChecksumSha256?: string;
       expiresAt?: string;
     }
   ) {

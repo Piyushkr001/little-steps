@@ -11,6 +11,10 @@ export const ALL_ADMIN_PERMISSIONS: readonly AdminPermission[] = [
   "users:manage",
   "providers:read",
   "providers:verify",
+  "documents:read",
+  "documents:review",
+  "documents:upload",
+  "documents:scan",
   "centers:manage",
   "bookings:read",
   "bookings:manage",
@@ -31,6 +35,10 @@ export const ADMIN_ALLOWED_PERMISSIONS: ReadonlySet<AdminPermission> =
     "users:manage",
     "providers:read",
     "providers:verify",
+    "documents:read",
+    "documents:review",
+    "documents:upload",
+    "documents:scan",
     "centers:manage",
     "bookings:read",
     "bookings:manage",
@@ -47,6 +55,10 @@ export const DEFAULT_STANDARD_ADMIN_PERMISSIONS: readonly AdminPermission[] = [
   "users:manage",
   "providers:read",
   "providers:verify",
+  "documents:read",
+  "documents:review",
+  "documents:upload",
+  "documents:scan",
   "centers:manage",
   "bookings:read",
   "bookings:manage",
@@ -61,6 +73,9 @@ const IMPLIED_READ_PERMISSIONS: Partial<
 > = {
   "users:manage": ["users:read"],
   "providers:verify": ["providers:read"],
+  "documents:review": ["documents:read"],
+  "documents:upload": ["documents:read"],
+  "documents:scan": ["documents:read"],
   "centers:manage": ["providers:read"],
   "bookings:manage": ["bookings:read"],
   "incidents:manage": ["incidents:read"],
@@ -126,6 +141,10 @@ export function resolveEffectiveAdminPermissions(
   if (hasFullLegacyOperationalSet) {
     effective.add("dashboard:read");
     effective.add("reports:read");
+    effective.add("documents:read");
+    effective.add("documents:review");
+    effective.add("documents:upload");
+    effective.add("documents:scan");
   }
 
   return Array.from(effective);

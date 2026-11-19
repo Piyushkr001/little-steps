@@ -45,19 +45,47 @@ export function setAdminOtpMailInterceptorForTests(
   testMailInterceptor = interceptor;
 }
 
-function createSmtpTransporter(): Transporter {
-  const host = process.env.SMTP_HOST?.trim();
-  const port = Number(process.env.SMTP_PORT || 587);
-  const user = process.env.SMTP_USER?.trim();
-  const pass = process.env.SMTP_PASS?.replace(/\s+/g, "");
-  const secure =
-    process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465;
+export interface ResolvedSmtpConfig {
+  host: string;
+  port: number;
+  user: string;
+  pass: string;
+  secure: boolean;
+}
 
-  if (!host || !user || !pass) {
+/**
+ * Resolves SMTP configuration from environment variables while preserving
+ * `SMTP_PASS` verbatim (never stripping or mutating whitespace in credentials).
+ */
+export function resolveSmtpTransportConfig(
+  env: NodeJS.ProcessEnv = process.env
+): ResolvedSmtpConfig {
+  const host = env.SMTP_HOST?.trim();
+  const port = Number(env.SMTP_PORT || 587);
+  const user = env.SMTP_USER?.trim();
+  const pass = env.SMTP_PASS;
+  const secure =
+    env.SMTP_SECURE === "true" || Number(env.SMTP_PORT) === 465;
+
+  if (
+    !host ||
+    !user ||
+    typeof pass !== "string" ||
+    pass.length === 0 ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65535
+  ) {
     throw new AdminMailDeliveryError(
       "Email delivery service is not configured. Please contact platform security operations."
     );
   }
+
+  return { host, port, user, pass, secure };
+}
+
+function createSmtpTransporter(): Transporter {
+  const { host, port, user, pass, secure } = resolveSmtpTransportConfig();
 
   // Invalidate cached transporter automatically if Next.js reloads .env values
   const configKey = crypto

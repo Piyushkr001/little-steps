@@ -1,9 +1,14 @@
-import express, { type Request, type Response } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+} from "express";
 import {
   dispatchAdminApiRequest,
   handleDocumentContentStreamRequest,
 } from "./dispatcher";
 import { extractTrustedClientIp } from "./middleware/rate-limit";
+import { MAX_JSON_UPLOAD_REQUEST_BYTES } from "./services/document-storage.service";
 
 function parseCookieHeader(cookieHeader?: string): Record<string, string> {
   if (!cookieHeader) return {};
@@ -40,10 +45,28 @@ function extractExpressRequestMeta(req: Request) {
 export function createExpressApp() {
   const app = express();
   app.disable("x-powered-by");
-  // Allow larger base64 JSON payloads specifically for document upload
+  // Enforce early Content-Length bound & 14 MB base64 JSON cap specifically for document upload
   app.use(
     "/api/v1/admin/verification-documents/upload",
-    express.json({ limit: "15mb" })
+    (req: Request, res: Response, next: NextFunction) => {
+      const contentLength = Number(req.headers["content-length"] ?? 0);
+      if (
+        Number.isFinite(contentLength) &&
+        contentLength > MAX_JSON_UPLOAD_REQUEST_BYTES
+      ) {
+        res.status(413).json({
+          success: false,
+          error: {
+            code: "PAYLOAD_TOO_LARGE",
+            message:
+              "Upload request exceeds maximum allowed payload size (14 MB encoded / 10 MB document).",
+          },
+        });
+        return;
+      }
+      next();
+    },
+    express.json({ limit: MAX_JSON_UPLOAD_REQUEST_BYTES })
   );
   app.use(express.json({ limit: "1mb" }));
 
@@ -117,6 +140,31 @@ export function createExpressApp() {
 
     res.status(result.status).json(result.body);
   });
+
+  app.use(
+    (
+      err: { type?: string; status?: number; statusCode?: number },
+      _req: Request,
+      res: Response,
+      next: NextFunction
+    ) => {
+      if (
+        err?.type === "entity.too.large" ||
+        err?.status === 413 ||
+        err?.statusCode === 413
+      ) {
+        res.status(413).json({
+          success: false,
+          error: {
+            code: "PAYLOAD_TOO_LARGE",
+            message: "Request payload exceeds the maximum allowed size limit.",
+          },
+        });
+        return;
+      }
+      next(err);
+    }
+  );
 
   return app;
 }

@@ -1,0 +1,67 @@
+name: Little Steps CI — Security, Storage & PostgreSQL Transactions
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: littlesteps_test
+          POSTGRES_PASSWORD: littlesteps_test_password
+          POSTGRES_DB: littlesteps_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U littlesteps_test -d littlesteps_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    env:
+      CI: "true"
+      REQUIRE_PG_TESTS: "true"
+      DRIZZLE_TARGET: "test"
+      TEST_DATABASE_URL: "postgresql://littlesteps_test:littlesteps_test_password@127.0.0.1:5432/littlesteps_test"
+      ADMIN_OTP_HMAC_SECRET: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
+      ADMIN_SESSION_SECRET: "f0e1d2c3b4a5968778695a4b3c2d1e0ff0e1d2c3b4a5968778695a4b3c2d1e0f"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.10
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: TypeScript type check
+        run: ./node_modules/.bin/tsc --noEmit
+
+      - name: ESLint validation
+        run: ./node_modules/.bin/eslint .
+
+      - name: Run Admin Portal Security & Workflow Suite
+        run: ./node_modules/.bin/jiti tests/admin-portal.test.ts
+
+      - name: Run Storage & Malware Scanner Integration Suite
+        run: ./node_modules/.bin/jiti tests/document-storage-scanner.test.ts
+
+      - name: Apply Drizzle migrations to isolated CI PostgreSQL database
+        run: ./node_modules/.bin/drizzle-kit migrate
+
+      - name: Run Required Live PostgreSQL Transaction Suite
+        run: ./node_modules/.bin/jiti tests/postgres-transaction.test.ts
+
+      - name: Production Build Verification
+        run: ./node_modules/.bin/next build --webpack

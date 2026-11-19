@@ -11,12 +11,14 @@ import {
   Eye,
   FileCheck2,
   FilePlus2,
+  HardDrive,
   History,
   RefreshCw,
   ScanSearch,
   Search,
   ShieldAlert,
   ShieldCheck,
+  UploadCloud,
   UserCheck,
   XCircle,
 } from "lucide-react";
@@ -45,6 +47,7 @@ import { Textarea } from "@/components/ui/textarea";
 import {
   type AdminCaregiverVerificationItem,
   type AdminCenterVerificationItem,
+  type AdminDocumentDiagnosticsStatus,
   type AdminVerificationDocumentItem,
   type AdminVerificationItem,
   caregiverVerifications,
@@ -141,7 +144,26 @@ function VerificationsContent() {
     "approve" | "reject" | null
   >(null);
   const [evidenceReviewed, setEvidenceReviewed] = useState(false);
+  const [previewLoaded, setPreviewLoaded] = useState(false);
   const [replacementRequested, setReplacementRequested] = useState(true);
+  const [docSystemStatus, setDocSystemStatus] =
+    useState<AdminDocumentDiagnosticsStatus | null>(null);
+
+  // Document upload dialog state
+  const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadProviderId, setUploadProviderId] = useState("");
+  const [uploadCategory, setUploadCategory] = useState<
+    "PROVIDER" | "CENTER" | "CAREGIVER"
+  >("PROVIDER");
+  const [uploadCenterId, setUploadCenterId] = useState("");
+  const [uploadCaregiverId, setUploadCaregiverId] = useState("");
+  const [uploadDocType, setUploadDocType] = useState("STATE_CHILDCARE_LICENSE");
+  const [uploadDocTitle, setUploadDocTitle] = useState("");
+  const [uploadExpiresAt, setUploadExpiresAt] = useState("");
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
 
   // Shared modal fields
   const [comments, setComments] = useState("");
@@ -158,22 +180,26 @@ function VerificationsContent() {
     try {
       const statusParam = statusFilter !== "ALL" ? statusFilter : undefined;
       const searchParam = search || undefined;
-      const [provData, cenData, cgData, docData] = await Promise.all([
+      const [provData, cenData, cgData, docData, statusInfo] = await Promise.all([
         verifications.list({ status: statusParam, search: searchParam }),
         centerVerifications.list({ status: statusParam, search: searchParam }),
         caregiverVerifications.list({
           status: statusParam,
           search: searchParam,
         }),
-        verificationDocuments.list({
-          status: statusParam,
-          search: searchParam,
-        }),
+        verificationDocuments
+          .list({
+            status: statusParam,
+            search: searchParam,
+          })
+          .catch(() => [] as AdminVerificationDocumentItem[]),
+        verificationDocuments.getStatus().catch(() => null),
       ]);
       setProviderItems(provData);
       setCenterItems(cenData);
       setCaregiverItems(cgData);
       setDocumentItems(docData);
+      setDocSystemStatus(statusInfo);
     } catch (err) {
       setError(extractApiErrorMessage(err));
     } finally {
@@ -194,6 +220,7 @@ function VerificationsContent() {
     setInspectedDocument(doc);
     setDocumentDialogMode(mode);
     setEvidenceReviewed(false);
+    setPreviewLoaded(false);
     setComments("");
     setRejectionReason("");
     setReplacementRequested(true);
@@ -201,10 +228,73 @@ function VerificationsContent() {
     try {
       const fullDoc = await verificationDocuments.getById(doc.id);
       setInspectedDocument(fullDoc);
+      if (fullDoc.recentlyAccessedByCurrentAdmin) {
+        setPreviewLoaded(true);
+      }
     } catch (err) {
       setError(extractApiErrorMessage(err));
     } finally {
       setDocDetailLoading(false);
+    }
+  };
+
+  const handleUploadDocument = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setUploadError(null);
+    if (!uploadFile) {
+      setUploadError("Please select a PDF, PNG, or JPEG file to upload.");
+      return;
+    }
+    const maxBytes = docSystemStatus?.maxUploadSizeBytes ?? 10 * 1024 * 1024;
+    if (uploadFile.size > maxBytes) {
+      setUploadError(
+        `Selected file exceeds the ${Math.round(maxBytes / (1024 * 1024))} MB maximum size limit.`
+      );
+      return;
+    }
+    if (!uploadProviderId) {
+      setUploadError("Please select the target provider organization.");
+      return;
+    }
+
+    setUploading(true);
+    setUploadProgress(5);
+    try {
+      const formData = new FormData();
+      formData.append("file", uploadFile);
+      formData.append("providerId", uploadProviderId);
+      formData.append("documentCategory", uploadCategory);
+      if (uploadCategory === "CENTER" && uploadCenterId) {
+        formData.append("centerId", uploadCenterId);
+      }
+      if (uploadCategory === "CAREGIVER" && uploadCaregiverId) {
+        formData.append("caregiverId", uploadCaregiverId);
+      }
+      formData.append("documentType", uploadDocType.trim().toUpperCase());
+      formData.append("documentTitle", uploadDocTitle.trim());
+      if (uploadExpiresAt) {
+        formData.append("expiresAt", new Date(uploadExpiresAt).toISOString());
+      }
+
+      const res = await verificationDocuments.upload(formData, {
+        onUploadProgress: (pct) => setUploadProgress(pct),
+      });
+
+      setUploadProgress(100);
+      setFeedback(
+        `Uploaded "${uploadDocTitle.trim()}" to private storage (Scan status: ${res.malwareScanStatus}).`
+      );
+      setUploadDialogOpen(false);
+      setUploadFile(null);
+      setUploadDocTitle("");
+      setUploadExpiresAt("");
+      setUploadProgress(0);
+      await loadAllQueues();
+    } catch (err) {
+      setUploadError(extractApiErrorMessage(err));
+      setUploadProgress(0);
+    } finally {
+      setUploading(false);
     }
   };
 
@@ -380,6 +470,10 @@ function VerificationsContent() {
         await verificationDocuments.approve(activeDocument.id, {
           reviewNotes: comments.trim(),
           evidenceReviewed: true,
+          reviewedChecksumSha256:
+            inspectedDocument?.checksumSha256 ||
+            activeDocument.checksumSha256 ||
+            undefined,
         });
         setFeedback(`Approved document "${activeDocument.documentTitle}".`);
       } else if (documentDialogMode === "reject") {
@@ -1019,87 +1113,145 @@ function VerificationsContent() {
                 })}
               </div>
             )
-          ) : documentItems.length === 0 ? (
-            <div className="rounded-2xl border border-dashed py-12 text-center text-sm text-muted-foreground">
-              No verification documents match your current filters.
-            </div>
           ) : (
-            <div className="space-y-3">
-              {documentItems.map((doc) => (
-                <div
-                  key={doc.id}
-                  className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-200/80 bg-background p-4 shadow-2xs sm:flex-row sm:items-center dark:border-border"
-                >
-                  <div className="space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="font-bold text-sm">
-                        {doc.documentTitle}
-                      </span>
-                      <StatusPill status={doc.status} />
-                      <StatusPill status={doc.malwareScanStatus} />
-                      {doc.replacementRequested && (
-                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
-                          Replacement Requested
-                        </span>
-                      )}
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      Category:{" "}
-                      <strong>{doc.documentCategory || "PROVIDER"}</strong> •
-                      Type: <strong>{doc.documentType}</strong> • Provider:{" "}
-                      {doc.providerName || doc.providerId}
-                      {doc.centerName ? ` • Centre: ${doc.centerName}` : ""}
-                      {doc.caregiverName
-                        ? ` • Caregiver: ${doc.caregiverName}`
-                        : ""}{" "}
-                      • {Math.round(doc.fileSizeBytes / 1024)} KB •{" "}
-                      {doc.mimeType}
-                    </p>
-                    {doc.rejectionReason && (
-                      <p className="text-xs font-medium text-rose-600">
-                        Rejection Reason: {doc.rejectionReason}
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    {doc.malwareScanStatus !== "CLEAN" &&
-                      doc.malwareScanStatus !== "INFECTED" && (
-                        <Button
-                          variant="outline"
-                          size="xs"
-                          disabled={scanningDocId === doc.id}
-                          onClick={() => void handleScanDocument(doc.id)}
-                          className="gap-1 border-amber-300 text-amber-800 dark:text-amber-300"
-                        >
-                          <ScanSearch className="size-3.5" />
-                          {scanningDocId === doc.id ? "Scanning..." : "Scan"}
-                        </Button>
-                      )}
-                    <Button
-                      size="xs"
-                      onClick={() =>
-                        void openDocumentReviewDialog(doc, "approve")
-                      }
-                      className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65]"
-                    >
-                      <Eye className="size-3.5" />
-                      {doc.status === "VERIFIED"
-                        ? "Inspect Doc"
-                        : "Inspect & Review"}
-                    </Button>
-                    <Button
-                      variant="destructive"
-                      size="xs"
-                      onClick={() =>
-                        void openDocumentReviewDialog(doc, "reject")
-                      }
-                    >
-                      Reject Doc
-                    </Button>
-                  </div>
+            <div className="space-y-4">
+              {/* Storage & Malware Scanner Operational Status Strip */}
+              <div className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-200/80 bg-[#EAF8F5]/60 p-3.5 text-xs sm:flex-row sm:items-center dark:border-border dark:bg-teal-950/20">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-[#087F78] dark:text-teal-300">
+                    <HardDrive className="size-3.5" />
+                    Storage:{" "}
+                    {docSystemStatus?.storageDriver === "s3"
+                      ? "Persistent Private S3"
+                      : docSystemStatus?.storageDriver === "local"
+                        ? "Local Private Dev Storage"
+                        : "Persistent Storage Unconfigured"}
+                  </span>
+                  <StatusPill
+                    status={
+                      docSystemStatus?.uploadsEnabled ? "ACTIVE" : "SUSPENDED"
+                    }
+                  />
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-300">
+                    <ScanSearch className="size-3.5 text-[#087F78]" />
+                    Malware Scanner:{" "}
+                    {docSystemStatus?.scannerConfigured
+                      ? "ClamAV Configured"
+                      : "Unconfigured (Approval Gated)"}
+                  </span>
                 </div>
-              ))}
+                <Button
+                  size="xs"
+                  disabled={docSystemStatus?.uploadsEnabled === false}
+                  onClick={() => {
+                    setUploadError(null);
+                    setUploadProgress(0);
+                    setUploadFile(null);
+                    if (!uploadProviderId && providerItems.length > 0) {
+                      setUploadProviderId(providerItems[0].providerId);
+                    }
+                    setUploadDialogOpen(true);
+                  }}
+                  className="gap-1.5 self-start bg-[#087F78] text-white hover:bg-[#066B65] sm:self-auto"
+                >
+                  <UploadCloud className="size-3.5" />
+                  Upload Document
+                </Button>
+              </div>
+
+              {documentItems.length === 0 ? (
+                <div className="rounded-2xl border border-dashed py-12 text-center text-sm text-muted-foreground">
+                  No verification documents match your current filters.
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {documentItems.map((doc) => (
+                    <div
+                      key={doc.id}
+                      className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-200/80 bg-background p-4 shadow-2xs sm:flex-row sm:items-center dark:border-border"
+                    >
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-sm">
+                            {doc.documentTitle}
+                          </span>
+                          <StatusPill status={doc.status} />
+                          <StatusPill status={doc.malwareScanStatus} />
+                          {doc.replacementRequested && (
+                            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-800">
+                              Replacement Requested
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          Category:{" "}
+                          <strong>{doc.documentCategory || "PROVIDER"}</strong> •
+                          Type: <strong>{doc.documentType}</strong> • Provider:{" "}
+                          {doc.providerName || doc.providerId}
+                          {doc.centerName ? ` • Centre: ${doc.centerName}` : ""}
+                          {doc.caregiverName
+                            ? ` • Caregiver: ${doc.caregiverName}`
+                            : ""}{" "}
+                          • {Math.round(doc.fileSizeBytes / 1024)} KB •{" "}
+                          {doc.mimeType}
+                          {doc.createdAt
+                            ? ` • Uploaded ${new Date(doc.createdAt).toLocaleDateString()}`
+                            : ""}
+                          {doc.expiresAt
+                            ? ` • Expires ${new Date(doc.expiresAt).toLocaleDateString()}`
+                            : ""}
+                        </p>
+                        {doc.rejectionReason && (
+                          <p className="text-xs font-medium text-rose-600">
+                            Rejection Reason: {doc.rejectionReason}
+                          </p>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        {doc.malwareScanStatus !== "CLEAN" &&
+                          doc.malwareScanStatus !== "INFECTED" && (
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              disabled={scanningDocId === doc.id}
+                              onClick={() => void handleScanDocument(doc.id)}
+                              className="gap-1 border-amber-300 text-amber-800 dark:text-amber-300"
+                            >
+                              <ScanSearch className="size-3.5" />
+                              {scanningDocId === doc.id
+                                ? "Scanning..."
+                                : doc.malwareScanStatus === "ERROR"
+                                  ? "Retry Scan"
+                                  : "Scan"}
+                            </Button>
+                          )}
+                        <Button
+                          size="xs"
+                          onClick={() =>
+                            void openDocumentReviewDialog(doc, "approve")
+                          }
+                          className="gap-1 bg-[#087F78] text-white hover:bg-[#066B65]"
+                        >
+                          <Eye className="size-3.5" />
+                          {doc.status === "VERIFIED"
+                            ? "Inspect Doc"
+                            : "Inspect & Review"}
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          size="xs"
+                          onClick={() =>
+                            void openDocumentReviewDialog(doc, "reject")
+                          }
+                        >
+                          Reject Doc
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </CardContent>
@@ -1582,6 +1734,7 @@ function VerificationsContent() {
               !isQuarantined &&
               isClean &&
               Boolean(docDetail.contentAvailable) &&
+              (previewLoaded || Boolean(docDetail.recentlyAccessedByCurrentAdmin)) &&
               evidenceReviewed &&
               comments.trim().length >= 3;
 
@@ -1599,6 +1752,40 @@ function VerificationsContent() {
                     <span className="text-muted-foreground">Status:</span>
                     <StatusPill status={docDetail.status} />
                     <StatusPill status={docDetail.malwareScanStatus} />
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Association: </span>
+                    <strong>{docDetail.providerName || docDetail.providerId}</strong>
+                    {docDetail.centerName ? ` • ${docDetail.centerName}` : ""}
+                    {docDetail.caregiverName ? ` • ${docDetail.caregiverName}` : ""}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Storage: </span>
+                    <strong>
+                      {docDetail.storageScheme === "s3"
+                        ? "Persistent S3 Private"
+                        : docDetail.storageScheme === "local"
+                          ? "Local Private Storage"
+                          : "Unmanaged / Legacy"}
+                    </strong>
+                    {docDetail.checksumVerified ? " • Integrity Verified" : ""}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Uploaded: </span>
+                    <strong>
+                      {docDetail.createdAt
+                        ? new Date(docDetail.createdAt).toLocaleString()
+                        : "Unknown"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">Expires: </span>
+                    <strong className={docDetail.isExpired ? "text-rose-600" : ""}>
+                      {docDetail.expiresAt
+                        ? new Date(docDetail.expiresAt).toLocaleDateString()
+                        : "No expiration date"}
+                      {docDetail.isExpired ? " (EXPIRED)" : ""}
+                    </strong>
                   </div>
                   <div>
                     <span className="text-muted-foreground">File: </span>
@@ -1697,13 +1884,27 @@ function VerificationsContent() {
                   hasSignedPreview &&
                   docDetail.signedAccessUrl && (
                     <div className="space-y-1.5">
-                      <p className="text-xs font-semibold text-muted-foreground">
-                        Authenticated Document Content Preview
-                      </p>
+                      <div className="flex items-center justify-between text-xs text-muted-foreground">
+                        <span className="font-semibold">
+                          Authenticated Document Content Preview
+                        </span>
+                        <span
+                          className={
+                            previewLoaded
+                              ? "font-semibold text-[#087F78]"
+                              : "text-amber-700"
+                          }
+                        >
+                          {previewLoaded
+                            ? "Preview Loaded (Access Audited)"
+                            : "Loading authenticated stream..."}
+                        </span>
+                      </div>
                       <iframe
                         sandbox=""
                         src={docDetail.signedAccessUrl}
                         title={docDetail.documentTitle}
+                        onLoad={() => setPreviewLoaded(true)}
                         className="h-64 w-full rounded-xl border bg-white dark:bg-slate-950"
                       />
                     </div>
@@ -1851,6 +2052,212 @@ function VerificationsContent() {
               </div>
             );
           })()}
+        </DialogContent>
+      </Dialog>
+
+      {/* Upload Verification Document Dialog */}
+      <Dialog
+        open={uploadDialogOpen}
+        onOpenChange={(open) => {
+          if (!open && !uploading) {
+            setUploadDialogOpen(false);
+            setUploadError(null);
+          }
+        }}
+      >
+        <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Upload Compliance Verification Document</DialogTitle>
+            <DialogDescription>
+              Files are validated by magic signature (PDF, PNG, JPEG; max 10 MB),
+              stored privately, and placed in PENDING malware scan state until
+              scanned cleanly.
+            </DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleUploadDocument} className="space-y-4">
+            {uploadError && (
+              <Alert variant="destructive" className="rounded-xl">
+                <AlertTriangle className="size-4" />
+                <AlertTitle>Upload Blocked</AlertTitle>
+                <AlertDescription className="text-xs">
+                  {uploadError}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-provider">Provider Organization</Label>
+                <select
+                  id="upload-provider"
+                  required
+                  value={uploadProviderId}
+                  onChange={(e) => setUploadProviderId(e.target.value)}
+                  className="h-9 w-full rounded-md border bg-background px-3 text-xs"
+                >
+                  <option value="">Select provider...</option>
+                  {providerItems.map((p) => (
+                    <option key={p.providerId} value={p.providerId}>
+                      {p.organizationName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-category">Document Scope</Label>
+                <select
+                  id="upload-category"
+                  value={uploadCategory}
+                  onChange={(e) =>
+                    setUploadCategory(
+                      e.target.value as "PROVIDER" | "CENTER" | "CAREGIVER"
+                    )
+                  }
+                  className="h-9 w-full rounded-md border bg-background px-3 text-xs"
+                >
+                  <option value="PROVIDER">Provider Organization</option>
+                  <option value="CENTER">Daycare Centre</option>
+                  <option value="CAREGIVER">Caregiver</option>
+                </select>
+              </div>
+            </div>
+
+            {uploadCategory === "CENTER" && (
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-center">Target Daycare Centre</Label>
+                <select
+                  id="upload-center"
+                  required
+                  value={uploadCenterId}
+                  onChange={(e) => setUploadCenterId(e.target.value)}
+                  className="h-9 w-full rounded-md border bg-background px-3 text-xs"
+                >
+                  <option value="">Select daycare centre...</option>
+                  {centerItems
+                    .filter(
+                      (c) =>
+                        !uploadProviderId || c.providerId === uploadProviderId
+                    )
+                    .map((c) => (
+                      <option key={c.centerId} value={c.centerId}>
+                        {c.centerName} ({c.city})
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
+
+            {uploadCategory === "CAREGIVER" && (
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-caregiver">Target Caregiver</Label>
+                <select
+                  id="upload-caregiver"
+                  required
+                  value={uploadCaregiverId}
+                  onChange={(e) => setUploadCaregiverId(e.target.value)}
+                  className="h-9 w-full rounded-md border bg-background px-3 text-xs"
+                >
+                  <option value="">Select caregiver...</option>
+                  {caregiverItems
+                    .filter(
+                      (cg) =>
+                        !uploadProviderId || cg.providerId === uploadProviderId
+                    )
+                    .map((cg) => (
+                      <option key={cg.caregiverId} value={cg.caregiverId}>
+                        {cg.fullName} — {cg.centerName}
+                      </option>
+                    ))}
+                </select>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-doc-type">Document Type Code</Label>
+                <Input
+                  id="upload-doc-type"
+                  required
+                  value={uploadDocType}
+                  onChange={(e) => setUploadDocType(e.target.value)}
+                  placeholder="STATE_CHILDCARE_LICENSE"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="upload-expires">
+                  Expiration Date (Optional)
+                </Label>
+                <Input
+                  id="upload-expires"
+                  type="date"
+                  value={uploadExpiresAt}
+                  onChange={(e) => setUploadExpiresAt(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="upload-doc-title">Document Title</Label>
+              <Input
+                id="upload-doc-title"
+                required
+                minLength={2}
+                value={uploadDocTitle}
+                onChange={(e) => setUploadDocTitle(e.target.value)}
+                placeholder="e.g. State Childcare Operating License 2026"
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="upload-file-input">
+                Document File (PDF, PNG, JPEG — Max 10 MB)
+              </Label>
+              <Input
+                id="upload-file-input"
+                type="file"
+                required
+                accept="application/pdf,image/png,image/jpeg,.pdf,.png,.jpg,.jpeg"
+                onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)}
+              />
+            </div>
+
+            {uploading && (
+              <div className="space-y-1">
+                <div className="flex justify-between text-xs text-muted-foreground">
+                  <span>Uploading to private storage...</span>
+                  <span>{uploadProgress}%</span>
+                </div>
+                <div className="h-2 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+                  <div
+                    className="h-full bg-[#087F78] transition-all duration-200"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              </div>
+            )}
+
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                disabled={uploading}
+                onClick={() => setUploadDialogOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                disabled={uploading || !uploadFile}
+                className="gap-1.5 bg-[#087F78] text-white hover:bg-[#066B65]"
+              >
+                <UploadCloud className="size-3.5" />
+                {uploading ? "Uploading..." : "Upload Securely"}
+              </Button>
+            </DialogFooter>
+          </form>
         </DialogContent>
       </Dialog>
     </div>

@@ -3635,12 +3635,46 @@ export async function getAdminVerificationDocumentById(
   }
 
   let contentAvailable = doc.contentAvailable;
+  let checksumVerified = false;
   if (contentAvailable) {
     const accessibility = await verifyStoredDocumentAccessible(
       rawDoc.storageReference,
       rawDoc.checksumSha256
     );
     contentAvailable = accessibility.accessible;
+    checksumVerified =
+      accessibility.accessible && Boolean(rawDoc.checksumSha256);
+  }
+
+  const storageScheme: "s3" | "local" | "unmanaged" =
+    rawDoc.storageReference.startsWith("s3-private://")
+      ? "s3"
+      : rawDoc.storageReference.startsWith("private://")
+        ? "local"
+        : "unmanaged";
+
+  let recentlyAccessedByCurrentAdmin = false;
+  if (adminId && rawDoc.checksumSha256) {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60_000);
+    const accessLogs = await safeSelectTable(() =>
+      db
+        .select()
+        .from(adminAuditLogs)
+        .where(
+          and(
+            eq(adminAuditLogs.entityId, doc.id),
+            eq(adminAuditLogs.action, "VERIFICATION_DOCUMENT_ACCESSED")
+          )
+        )
+    );
+    recentlyAccessedByCurrentAdmin = accessLogs.some((log) => {
+      const state = log.newState as { checksumSha256?: string } | null;
+      return (
+        log.adminUserId === adminId &&
+        log.createdAt >= cutoff &&
+        state?.checksumSha256 === rawDoc.checksumSha256
+      );
+    });
   }
 
   const canSignAccess = Boolean(
@@ -3674,6 +3708,9 @@ export async function getAdminVerificationDocumentById(
   return {
     ...doc,
     contentAvailable,
+    checksumVerified,
+    storageScheme,
+    recentlyAccessedByCurrentAdmin,
     signedAccessUrl,
     history,
     reviewHistory: history,
@@ -3684,6 +3721,7 @@ export async function approveVerificationDocument(params: {
   documentId: string;
   reviewNotes: string;
   evidenceReviewed: boolean;
+  reviewedChecksumSha256?: string;
   expiresAt?: string;
   admin: AuthenticatedAdmin;
   ipAddress?: string;
@@ -3707,16 +3745,22 @@ export async function approveVerificationDocument(params: {
   }
 
   const now = new Date();
+  let parsedOverrideExpiresAt: Date | null = null;
   if (params.expiresAt) {
-    const parsedExp = new Date(params.expiresAt);
-    if (Number.isNaN(parsedExp.getTime())) {
+    parsedOverrideExpiresAt = new Date(params.expiresAt);
+    if (
+      Number.isNaN(parsedOverrideExpiresAt.getTime()) ||
+      parsedOverrideExpiresAt <= now
+    ) {
       throw new AdminAuthError(
         "INVALID_EXPIRATION_DATE",
-        "Provided document expiration timestamp is invalid.",
+        "Provided document expiration timestamp must be a valid future date.",
         400
       );
     }
   }
+
+  const accessCutoff = new Date(now.getTime() - 24 * 60 * 60_000);
 
   const txResult = await db.transaction(async (tx) => {
     const [doc] = await executeWithRowLock(
@@ -3750,6 +3794,12 @@ export async function approveVerificationDocument(params: {
         "Document uploaders and provider owners cannot self-verify their own documents.",
         403
       );
+    }
+
+    // If the stored document is already expired, exit cleanly so expiry can be persisted
+    // in its own committed transaction (never lost to a thrown-error rollback).
+    if (doc.expiresAt && doc.expiresAt <= now) {
+      return { kind: "expired" as const, doc };
     }
 
     if (!ALLOWED_DOCUMENT_MIME_TYPES.has(doc.mimeType)) {
@@ -3798,20 +3848,17 @@ export async function approveVerificationDocument(params: {
       );
     }
 
-    const nextExpiresAt = params.expiresAt
-      ? new Date(params.expiresAt)
-      : doc.expiresAt;
-
-    if (nextExpiresAt && nextExpiresAt <= now) {
-      await tx
-        .update(verificationDocuments)
-        .set({ status: "EXPIRED", updatedAt: now })
-        .where(eq(verificationDocuments.id, doc.id));
-
+    const verifiedChecksum = contentCheck.actualSha256 || doc.checksumSha256;
+    if (
+      params.reviewedChecksumSha256 &&
+      verifiedChecksum &&
+      params.reviewedChecksumSha256.toLowerCase() !==
+        verifiedChecksum.toLowerCase()
+    ) {
       throw new AdminAuthError(
-        "DOCUMENT_EXPIRED",
-        "Cannot verify an expired document. Please request a replacement document.",
-        400
+        "DOCUMENT_VERSION_MISMATCH",
+        "Reviewed document checksum does not match the current stored document version. Please reload and re-inspect.",
+        409
       );
     }
 
@@ -3822,6 +3869,38 @@ export async function approveVerificationDocument(params: {
         409
       );
     }
+
+    // Evidence-backed review check: require a recent authorized content access event
+    // by this exact reviewer for this exact document checksum.
+    const accessLogs = await tx
+      .select()
+      .from(adminAuditLogs)
+      .where(
+        and(
+          eq(adminAuditLogs.entityId, doc.id),
+          eq(adminAuditLogs.action, "VERIFICATION_DOCUMENT_ACCESSED")
+        )
+      )
+      .orderBy(desc(adminAuditLogs.createdAt));
+
+    const matchingAccessLog = accessLogs.find((log) => {
+      const state = log.newState as { checksumSha256?: string } | null;
+      return (
+        log.adminUserId === params.admin.id &&
+        log.createdAt >= accessCutoff &&
+        (!verifiedChecksum || state?.checksumSha256 === verifiedChecksum)
+      );
+    });
+
+    if (!matchingAccessLog) {
+      throw new AdminAuthError(
+        "DOCUMENT_CONTENT_NOT_ACCESSED",
+        "You must inspect the authenticated document content preview for this exact file version before verifying it.",
+        400
+      );
+    }
+
+    const nextExpiresAt = parsedOverrideExpiresAt ?? doc.expiresAt;
 
     const updatedDocs = await tx
       .update(verificationDocuments)
@@ -3862,10 +3941,12 @@ export async function approveVerificationDocument(params: {
       reviewComments: trimmedNotes,
       evidenceSnapshot: {
         documentType: doc.documentType,
-        checksumSha256: doc.checksumSha256,
+        checksumSha256: verifiedChecksum,
         malwareScanProvider: doc.malwareScanProvider,
         malwareScannedAt: doc.malwareScannedAt?.toISOString() ?? null,
         evidenceReviewed: true,
+        evidenceAccessAuditId: matchingAccessLog.id,
+        evidenceAccessedAt: matchingAccessLog.createdAt.toISOString(),
       },
       createdAt: now,
     });
@@ -3883,6 +3964,8 @@ export async function approveVerificationDocument(params: {
           status: "VERIFIED",
           documentType: doc.documentType,
           malwareScanProvider: doc.malwareScanProvider,
+          checksumSha256: verifiedChecksum,
+          evidenceAccessAuditId: matchingAccessLog.id,
         },
         ipAddress: params.ipAddress,
         userAgent: params.userAgent,
@@ -3890,12 +3973,93 @@ export async function approveVerificationDocument(params: {
       tx
     );
 
-    return { doc, nextExpiresAt };
+    return { kind: "approved" as const, doc, nextExpiresAt, verifiedChecksum };
   });
+
+  if (txResult.kind === "expired") {
+    // Persist the EXPIRED transition atomically in its own committed transaction
+    // so status, review history, and audit log are durably recorded before returning 400.
+    await db.transaction(async (tx) => {
+      const [lockedDoc] = await executeWithRowLock(
+        tx
+          .select()
+          .from(verificationDocuments)
+          .where(eq(verificationDocuments.id, txResult.doc.id))
+          .limit(1)
+      );
+
+      if (
+        lockedDoc &&
+        lockedDoc.status !== "EXPIRED" &&
+        lockedDoc.status !== "REJECTED" &&
+        lockedDoc.expiresAt &&
+        lockedDoc.expiresAt <= now
+      ) {
+        const expiredRows = await tx
+          .update(verificationDocuments)
+          .set({
+            status: "EXPIRED",
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(verificationDocuments.id, lockedDoc.id),
+              eq(verificationDocuments.status, lockedDoc.status)
+            )
+          )
+          .returning({ id: verificationDocuments.id });
+
+        if (expiredRows.length > 0) {
+          await appendVerificationReviewHistory(tx, {
+            subjectType: "DOCUMENT",
+            subjectId: lockedDoc.id,
+            previousStatus: lockedDoc.status,
+            newStatus: "EXPIRED",
+            decision: "EXPIRED",
+            reviewerId: params.admin.id,
+            reviewerEmail: params.admin.email,
+            reviewComments:
+              "Document approval blocked and status transitioned to EXPIRED because expiresAt has passed.",
+            evidenceSnapshot: {
+              documentType: lockedDoc.documentType,
+              expiresAt: lockedDoc.expiresAt.toISOString(),
+            },
+            createdAt: now,
+          });
+
+          await recordAdminAuditLog(
+            {
+              adminUserId: params.admin.id,
+              adminEmail: params.admin.email,
+              action: "VERIFICATION_DOCUMENT_EXPIRED",
+              entityType: "VERIFICATION_DOCUMENT",
+              entityId: lockedDoc.id,
+              summary: `Marked expired document "${lockedDoc.documentTitle}" (${lockedDoc.documentType}) as EXPIRED during review attempt`,
+              previousState: { status: lockedDoc.status },
+              newState: {
+                status: "EXPIRED",
+                expiresAt: lockedDoc.expiresAt.toISOString(),
+              },
+              ipAddress: params.ipAddress,
+              userAgent: params.userAgent,
+            },
+            tx
+          );
+        }
+      }
+    });
+
+    throw new AdminAuthError(
+      "DOCUMENT_EXPIRED",
+      "Cannot verify an expired document. The document has been marked EXPIRED; please request a replacement document.",
+      400
+    );
+  }
 
   return {
     documentId: txResult.doc.id,
     status: "VERIFIED" as const,
+    checksumSha256: txResult.verifiedChecksum,
     reviewedBy: params.admin.email,
     reviewedAt: now.toISOString(),
   };
@@ -4970,33 +5134,114 @@ export async function inspectPhase2HistoricalDataImpact() {
 }
 
 /**
- * Read-only Phase 2.1 diagnostic report identifying historical `CLEAN` verification documents
- * that lack backend malware scanner evidence or private managed storage.
+ * Read-only Final Phase 2.1 compliance diagnostic report identifying historical
+ * verification documents lacking trusted scan provenance, checksums, durable
+ * storage content, consistent scan metadata, or non-expired validity.
+ * Never mutates or deletes any database record or file.
  */
 export async function inspectHistoricalCleanDocumentsImpact() {
   const allDocs = await db.select().from(verificationDocuments);
+  const now = new Date();
 
-  const historicalUnscannedCleanDocs = allDocs.filter(
-    (d) =>
-      d.malwareScanStatus === "CLEAN" &&
-      (!d.malwareScannedAt || !d.malwareScanProvider)
-  );
+  const cleanWithoutProviderIds: string[] = [];
+  const cleanWithoutTimestampIds: string[] = [];
+  const missingChecksumIds: string[] = [];
+  const unavailableStoredContentIds: string[] = [];
+  const nonManagedStorageIds: string[] = [];
+  const inconsistentScanMetadataIds: string[] = [];
+  const expiredVerifiedDocumentIds: string[] = [];
+  const quarantinedIds: string[] = [];
+  const reviewRequiredSet = new Set<string>();
 
-  const nonManagedStorageDocs = allDocs.filter(
-    (d) => !isManagedPrivateStorageReference(d.storageReference)
-  );
+  for (const d of allDocs) {
+    const isQuarantined =
+      d.malwareScanStatus === "INFECTED" || Boolean(d.quarantinedAt);
+    if (isQuarantined) {
+      quarantinedIds.push(d.id);
+    }
 
-  const quarantinedDocs = allDocs.filter(
-    (d) => d.malwareScanStatus === "INFECTED" || Boolean(d.quarantinedAt)
+    if (d.malwareScanStatus === "CLEAN" && !d.malwareScanProvider) {
+      cleanWithoutProviderIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    }
+
+    if (d.malwareScanStatus === "CLEAN" && !d.malwareScannedAt) {
+      cleanWithoutTimestampIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    }
+
+    if (!d.checksumSha256 || !/^[0-9a-fA-F]{64}$/.test(d.checksumSha256)) {
+      missingChecksumIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    }
+
+    if (!isManagedPrivateStorageReference(d.storageReference)) {
+      nonManagedStorageIds.push(d.id);
+      unavailableStoredContentIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    } else {
+      const check = await verifyStoredDocumentAccessible(
+        d.storageReference,
+        d.checksumSha256
+      );
+      if (!check.accessible) {
+        unavailableStoredContentIds.push(d.id);
+        reviewRequiredSet.add(d.id);
+      }
+    }
+
+    const hasInconsistentMeta =
+      (d.malwareScanStatus === "INFECTED" && !d.quarantinedAt) ||
+      (Boolean(d.quarantinedAt) &&
+        (d.malwareScanStatus === "CLEAN" || d.status === "VERIFIED")) ||
+      (d.malwareScanStatus === "CLEAN" &&
+        d.malwareScanProvider === "UNCONFIGURED") ||
+      (d.malwareScanStatus === "PENDING" && Boolean(d.malwareScannedAt));
+    if (hasInconsistentMeta) {
+      inconsistentScanMetadataIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    }
+
+    if (d.status === "VERIFIED" && d.expiresAt && d.expiresAt <= now) {
+      expiredVerifiedDocumentIds.push(d.id);
+      reviewRequiredSet.add(d.id);
+    }
+  }
+
+  const historicalUnscannedCleanIds = Array.from(
+    new Set([...cleanWithoutProviderIds, ...cleanWithoutTimestampIds])
   );
+  const documentsRequiringReviewIds = Array.from(reviewRequiredSet);
 
   return {
+    generatedAt: now.toISOString(),
+    readOnly: true as const,
     totalDocuments: allDocs.length,
-    historicalUnscannedCleanCount: historicalUnscannedCleanDocs.length,
-    historicalUnscannedCleanIds: historicalUnscannedCleanDocs.map((d) => d.id),
-    nonManagedStorageCount: nonManagedStorageDocs.length,
-    nonManagedStorageIds: nonManagedStorageDocs.map((d) => d.id),
-    quarantinedCount: quarantinedDocs.length,
-    quarantinedIds: quarantinedDocs.map((d) => d.id),
+    historicalUnscannedCleanCount: historicalUnscannedCleanIds.length,
+    historicalUnscannedCleanIds,
+    cleanWithoutProviderCount: cleanWithoutProviderIds.length,
+    cleanWithoutProviderIds,
+    cleanWithoutTimestampCount: cleanWithoutTimestampIds.length,
+    cleanWithoutTimestampIds,
+    missingChecksumCount: missingChecksumIds.length,
+    missingChecksumIds,
+    unavailableStoredContentCount: unavailableStoredContentIds.length,
+    unavailableStoredContentIds,
+    nonManagedStorageCount: nonManagedStorageIds.length,
+    nonManagedStorageIds,
+    inconsistentScanMetadataCount: inconsistentScanMetadataIds.length,
+    inconsistentScanMetadataIds,
+    expiredVerifiedDocumentCount: expiredVerifiedDocumentIds.length,
+    expiredVerifiedDocumentIds,
+    quarantinedCount: quarantinedIds.length,
+    quarantinedIds,
+    documentsRequiringReviewCount: documentsRequiringReviewIds.length,
+    documentsRequiringReviewIds,
+    remediationGuidance: [
+      "Do not overwrite historical records automatically; preserve audit history.",
+      "Documents missing trusted scan provenance are already excluded from new provider/centre/caregiver approvals.",
+      "Run migrateLocalDocumentsToPersistentStorage (dryRun first) for legacy private:// files that remain accessible.",
+      "For unavailable or unverified legacy files, request replacement documents through the Admin Verification UI.",
+    ],
   };
 }

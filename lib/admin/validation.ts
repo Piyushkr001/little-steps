@@ -206,6 +206,11 @@ export const approveVerificationDocumentSchema = z
     evidenceReviewed: z.literal(true, {
       error: "Administrator must confirm document content was reviewed",
     }),
+    reviewedChecksumSha256: z
+      .string()
+      .trim()
+      .regex(/^[0-9a-fA-F]{64}$/, "Valid 64-character SHA-256 checksum required")
+      .optional(),
     expiresAt: z.string().datetime().optional(),
   })
   .strict();

@@ -42,12 +42,15 @@ import {
   verifyAdminOtpAndCreateSession,
 } from "./services/admin-auth.service";
 import { recordAdminAuditLog } from "./services/audit.service";
+import { validateRuntimeConfiguration } from "./config/runtime-config";
 import {
   getAdminDashboardActivity,
   getAdminDashboardAnalytics,
   getAdminDashboardStats,
 } from "./services/dashboard.service";
+import { isMalwareScannerConfigured } from "./services/document-scanner.service";
 import {
+  getActiveDocumentStorageDriverInfo,
   MAX_DOCUMENT_SIZE_BYTES,
   readAuthorizedDocumentContent,
   runAndPersistDocumentScan,
@@ -70,6 +73,7 @@ import {
   getAdminReportsData,
   getAdminUserById,
   getAdminVerificationDocumentById,
+  inspectHistoricalCleanDocumentsImpact,
   listAdminAuditLogs,
   listAdminBookings,
   listAdminCaregiverVerifications,
@@ -884,7 +888,7 @@ export async function dispatchAdminApiRequest(
     // ==========================================
 
     if (routeKey === "GET /verification-documents") {
-      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      await requireAdminPermission(admin, "documents:read", req, routeKey);
       const items = await listAdminVerificationDocuments({
         status: req.query.status,
         providerId: req.query.providerId,
@@ -895,12 +899,40 @@ export async function dispatchAdminApiRequest(
       return { status: 200, body: { success: true, data: items } };
     }
 
+    if (routeKey === "GET /verification-documents/diagnostics/status") {
+      await requireAdminPermission(admin, "documents:read", req, routeKey);
+      const storageInfo = getActiveDocumentStorageDriverInfo();
+      const configReport = validateRuntimeConfiguration();
+      return {
+        status: 200,
+        body: {
+          success: true,
+          data: {
+            storageDriver: storageInfo.driver,
+            uploadsEnabled: storageInfo.uploadsEnabled,
+            storageMessage: storageInfo.message,
+            scannerConfigured: isMalwareScannerConfigured(),
+            maxUploadSizeBytes: MAX_DOCUMENT_SIZE_BYTES,
+            productionReady: configReport.productionReady,
+          },
+        },
+      };
+    }
+
+    if (
+      routeKey === "GET /verification-documents/diagnostics/historical-report"
+    ) {
+      await requireAdminPermission(admin, "documents:read", req, routeKey);
+      const report = await inspectHistoricalCleanDocumentsImpact();
+      return { status: 200, body: { success: true, data: report } };
+    }
+
     if (
       method === "GET" &&
       req.segments[0] === "verification-documents" &&
       req.segments.length === 2
     ) {
-      await requireAdminPermission(admin, "providers:read", req, routeKey);
+      await requireAdminPermission(admin, "documents:read", req, routeKey);
       const item = await getAdminVerificationDocumentById(
         req.segments[1],
         admin.id
@@ -909,7 +941,7 @@ export async function dispatchAdminApiRequest(
     }
 
     if (routeKey === "POST /verification-documents/upload") {
-      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      await requireAdminPermission(admin, "documents:upload", req, routeKey);
       const [ipLimit, acctLimit] = await Promise.all([
         checkRateLimit(`doc-upload-ip:${req.ipAddress}`, 30, 10 * 60_000),
         checkRateLimit(`doc-upload-acct:${admin.id}`, 30, 10 * 60_000),
@@ -929,15 +961,27 @@ export async function dispatchAdminApiRequest(
       }
 
       const parsed = uploadVerificationDocumentSchema.parse(req.body);
-      const fileBuffer = Buffer.from(parsed.fileBase64, "base64");
-      if (
-        fileBuffer.byteLength === 0 ||
-        fileBuffer.byteLength > MAX_DOCUMENT_SIZE_BYTES
-      ) {
+      const estimatedBytes = Math.ceil((parsed.fileBase64.length * 3) / 4);
+      if (estimatedBytes > MAX_DOCUMENT_SIZE_BYTES + 16) {
         throw new AdminAuthError(
-          "INVALID_DOCUMENT_SIZE",
-          "Uploaded verification document must be between 1 byte and 10 MB.",
+          "PAYLOAD_TOO_LARGE",
+          "Uploaded verification document exceeds the 10 MB security size limit.",
+          413
+        );
+      }
+      const fileBuffer = Buffer.from(parsed.fileBase64, "base64");
+      if (fileBuffer.byteLength === 0) {
+        throw new AdminAuthError(
+          "EMPTY_DOCUMENT_FILE",
+          "Uploaded verification document cannot be empty.",
           400
+        );
+      }
+      if (fileBuffer.byteLength > MAX_DOCUMENT_SIZE_BYTES) {
+        throw new AdminAuthError(
+          "PAYLOAD_TOO_LARGE",
+          "Uploaded verification document exceeds the 10 MB security size limit.",
+          413
         );
       }
 
@@ -977,7 +1021,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "scan"
     ) {
-      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      await requireAdminPermission(admin, "documents:scan", req, routeKey);
       const [ipLimit, acctLimit] = await Promise.all([
         checkRateLimit(`doc-scan-ip:${req.ipAddress}`, 30, 10 * 60_000),
         checkRateLimit(`doc-scan-acct:${admin.id}`, 30, 10 * 60_000),
@@ -1017,12 +1061,13 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "approve"
     ) {
-      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      await requireAdminPermission(admin, "documents:review", req, routeKey);
       const parsed = approveVerificationDocumentSchema.parse(req.body);
       const result = await approveVerificationDocument({
         documentId: req.segments[1],
         reviewNotes: parsed.reviewNotes,
         evidenceReviewed: parsed.evidenceReviewed,
+        reviewedChecksumSha256: parsed.reviewedChecksumSha256,
         expiresAt: parsed.expiresAt,
         admin,
         ipAddress: req.ipAddress,
@@ -1044,7 +1089,7 @@ export async function dispatchAdminApiRequest(
       req.segments.length === 3 &&
       req.segments[2] === "reject"
     ) {
-      await requireAdminPermission(admin, "providers:verify", req, routeKey);
+      await requireAdminPermission(admin, "documents:review", req, routeKey);
       const parsed = rejectVerificationDocumentSchema.parse(req.body);
       const result = await rejectVerificationDocument({
         documentId: req.segments[1],
@@ -1412,7 +1457,7 @@ export async function handleDocumentContentStreamRequest(
   try {
     const admin = await requireAuthenticatedAdmin(req, false);
     const routeKey = `GET /verification-documents/${documentId}/content`;
-    await requireAdminPermission(admin, "providers:read", req, routeKey);
+    await requireAdminPermission(admin, "documents:read", req, routeKey);
 
     const tokenParam = req.query.token;
     if (tokenParam) {
@@ -1464,6 +1509,7 @@ export async function handleDocumentContentStreamRequest(
         "Content-Disposition": `${disposition}; filename="${safeFileName}"`,
         "Cache-Control": "no-store, no-cache, must-revalidate, private",
         "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "SAMEORIGIN",
         "Content-Security-Policy": "default-src 'none'; sandbox",
       },
     };

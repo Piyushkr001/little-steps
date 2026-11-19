@@ -1,5 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server";
-import { uploadVerificationDocumentSchema } from "@/lib/admin/validation";
+import { uploadVerificationDocumentSchema } from "../lib/admin/validation";
 import {
   type CookieInstruction,
   dispatchAdminApiRequest,
@@ -13,6 +13,9 @@ import { checkRateLimit, extractTrustedClientIp } from "./middleware/rate-limit"
 import { AdminAuthError } from "./services/admin-auth.service";
 import {
   MAX_DOCUMENT_SIZE_BYTES,
+  MAX_JSON_UPLOAD_REQUEST_BYTES,
+  MAX_MULTIPART_REQUEST_BYTES,
+  readBoundedStreamWithChecksum,
   uploadAndRegisterVerificationDocument,
 } from "./services/document-storage.service";
 
@@ -65,6 +68,38 @@ export function applyCookiesToNextResponse(
   return response;
 }
 
+/**
+ * Enforces an HTTP request-body size ceiling BEFORE and DURING stream reading,
+ * returning HTTP 413 Payload Too Large immediately if Content-Length or actual
+ * streamed bytes exceed `maxBytes`.
+ */
+export async function readBoundedRequestBytes(
+  request: Request,
+  maxBytes: number
+): Promise<Buffer> {
+  const rawContentLength = request.headers.get("content-length");
+  if (rawContentLength !== null) {
+    const parsedLength = Number(rawContentLength.trim());
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      throw new AdminAuthError(
+        "PAYLOAD_TOO_LARGE",
+        `Request payload exceeds maximum allowed size (${Math.round(maxBytes / (1024 * 1024))} MB).`,
+        413
+      );
+    }
+  }
+
+  if (!request.body) {
+    return Buffer.alloc(0);
+  }
+
+  const { buffer } = await readBoundedStreamWithChecksum(
+    request.body,
+    maxBytes
+  );
+  return buffer;
+}
+
 export async function handleNextDocumentContentGet(
   request: NextRequest,
   documentId: string
@@ -98,28 +133,55 @@ const multipartMetadataSchema = uploadVerificationDocumentSchema.omit({
 export async function handleNextDocumentUploadPost(
   request: NextRequest
 ): Promise<NextResponse> {
-  const contentType = (request.headers.get("content-type") || "").toLowerCase();
-
-  if (!contentType.includes("multipart/form-data")) {
-    let body: unknown = {};
-    try {
-      body = await request.json();
-    } catch {
-      body = {};
-    }
-    const unifiedReq = extractUnifiedRequestFromNext(
-      request,
-      ["verification-documents", "upload"],
-      body
-    );
-    const result = await dispatchAdminApiRequest(unifiedReq);
-    return applyCookiesToNextResponse(
-      NextResponse.json(result.body, { status: result.status }),
-      result.cookiesToSet
-    );
-  }
+  const rawContentType = request.headers.get("content-type") || "";
+  const contentType = rawContentType.toLowerCase();
 
   try {
+    if (!contentType.includes("multipart/form-data")) {
+      // Authenticate & authorize before reading large JSON upload payloads
+      const preAuthReq = extractUnifiedRequestFromNext(
+        request,
+        ["verification-documents", "upload"],
+        undefined
+      );
+      const admin = await requireAuthenticatedAdmin(preAuthReq, true);
+      await requireAdminPermission(
+        admin,
+        "documents:upload",
+        preAuthReq,
+        "POST /verification-documents/upload"
+      );
+
+      const boundedBytes = await readBoundedRequestBytes(
+        request,
+        MAX_JSON_UPLOAD_REQUEST_BYTES
+      );
+      let body: unknown = {};
+      if (boundedBytes.byteLength > 0) {
+        try {
+          body = JSON.parse(boundedBytes.toString("utf8"));
+        } catch {
+          throw new AdminAuthError(
+            "INVALID_JSON_BODY",
+            "Upload request body must be valid JSON.",
+            400
+          );
+        }
+      }
+
+      const unifiedReq = extractUnifiedRequestFromNext(
+        request,
+        ["verification-documents", "upload"],
+        body
+      );
+      const result = await dispatchAdminApiRequest(unifiedReq);
+      return applyCookiesToNextResponse(
+        NextResponse.json(result.body, { status: result.status }),
+        result.cookiesToSet
+      );
+    }
+
+    // Multipart upload path: authenticate, authorize, and rate-limit BEFORE reading body bytes
     const unifiedReq = extractUnifiedRequestFromNext(
       request,
       ["verification-documents", "upload"],
@@ -127,7 +189,7 @@ export async function handleNextDocumentUploadPost(
     );
     const routeKey = "POST /verification-documents/upload";
     const admin = await requireAuthenticatedAdmin(unifiedReq, true);
-    await requireAdminPermission(admin, "providers:verify", unifiedReq, routeKey);
+    await requireAdminPermission(admin, "documents:upload", unifiedReq, routeKey);
 
     const [ipLimit, acctLimit] = await Promise.all([
       checkRateLimit(`doc-upload-ip:${unifiedReq.ipAddress}`, 30, 10 * 60_000),
@@ -147,7 +209,25 @@ export async function handleNextDocumentUploadPost(
       );
     }
 
-    const formData = await request.formData();
+    // Stream-bounded ingestion enforces the 11 MB HTTP multipart ceiling BEFORE formData() parses
+    const boundedMultipartBytes = await readBoundedRequestBytes(
+      request,
+      MAX_MULTIPART_REQUEST_BYTES
+    );
+
+    if (boundedMultipartBytes.byteLength === 0) {
+      throw new AdminAuthError(
+        "EMPTY_UPLOAD_BODY",
+        "Upload request body cannot be empty.",
+        400
+      );
+    }
+
+    const boundedResponse = new Response(new Uint8Array(boundedMultipartBytes), {
+      headers: { "content-type": rawContentType },
+    });
+    const formData = await boundedResponse.formData();
+
     const uploadedFile = formData.get("file");
     if (!(uploadedFile instanceof File)) {
       throw new AdminAuthError(
@@ -157,16 +237,36 @@ export async function handleNextDocumentUploadPost(
       );
     }
 
+    if (uploadedFile.size === 0) {
+      throw new AdminAuthError(
+        "EMPTY_DOCUMENT_FILE",
+        "Uploaded verification document cannot be empty.",
+        400
+      );
+    }
+
+    if (uploadedFile.size > MAX_DOCUMENT_SIZE_BYTES) {
+      throw new AdminAuthError(
+        "PAYLOAD_TOO_LARGE",
+        "Uploaded verification document exceeds the 10 MB security size limit.",
+        413
+      );
+    }
+
     const arrayBuffer = await uploadedFile.arrayBuffer();
     const fileBuffer = Buffer.from(arrayBuffer);
-    if (
-      fileBuffer.byteLength === 0 ||
-      fileBuffer.byteLength > MAX_DOCUMENT_SIZE_BYTES
-    ) {
+    if (fileBuffer.byteLength === 0) {
       throw new AdminAuthError(
-        "INVALID_DOCUMENT_SIZE",
-        "Uploaded verification document must be between 1 byte and 10 MB.",
+        "EMPTY_DOCUMENT_FILE",
+        "Uploaded verification document cannot be empty.",
         400
+      );
+    }
+    if (fileBuffer.byteLength > MAX_DOCUMENT_SIZE_BYTES) {
+      throw new AdminAuthError(
+        "PAYLOAD_TOO_LARGE",
+        "Uploaded verification document exceeds the 10 MB security size limit.",
+        413
       );
     }
 
